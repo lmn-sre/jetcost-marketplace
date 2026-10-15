@@ -1,0 +1,8 @@
+{
+  "name": "jetcost",
+  "version": "1.0.0",
+  "description": "Jetcost context and data skills for Claude",
+  "author": {
+    "name": "Jetcost Data & Analytics"
+  }
+}

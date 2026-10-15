@@ -1,0 +1,16 @@
+{
+  "name": "jetcost",
+  "owner": {
+    "name": "Jetcost Data & Analytics"
+  },
+  "metadata": {
+    "description": "Claude plugins for working with Jetcost context and data"
+  },
+  "plugins": [
+    {
+      "name": "jetcost",
+      "source": "./plugins/jetcost",
+      "description": "Jetcost context and data skills for Claude"
+    }
+  ]
+}
