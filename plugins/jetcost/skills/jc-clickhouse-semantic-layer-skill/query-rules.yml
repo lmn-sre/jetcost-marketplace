@@ -1,0 +1,621 @@
+# ═══════════════════════════════════════════════════════════════════
+# QUERY RULES
+# Rules to be applied to every ClickHouse extraction.
+# Claude MUST follow these rules and report applied rules in output
+#
+# Format:
+#   - id:          unique rule code (es. R001)
+#     description: rule explanation
+#     type:        rule type (default_filter | default_metric | default_exclusion | default_behavior)
+#     scope:       on which datamart the rule applies (all | sessions | searches | clicks | impressions | users)
+#                  may also be a YAML list of datamarts, e.g. [searches, clicks] — the
+#                  rule then applies only to those
+#     condition:   SQL condition (optional)
+#     notes:       additional notes (optional)
+#     active:      true/false if the rule is active or not
+# ═══════════════════════════════════════════════════════════════════
+
+rules:
+
+  # --- DEFAULT METRICS ---
+  - id: R022
+    name: Revenue routing — which total each grain can actually reach
+    description: >
+      An unqualified request for "revenue" resolves to a DIFFERENT metric at
+      each grain. This is not a stylistic choice: the widest perimeter a grain
+      can reach is a property of the grain. Display Media and Data Monetisation
+      are attributable neither to a search nor to a click, so they exist on
+      sessions alone.
+        sessions    → revenueCurrentProRataTotal  — whole business (Core + MAL + Media + Data Monetisation)
+        searches    → revenueCurrentFullCore      — Full Core (Core + MAL Core)
+        impressions → revenueCurrentFullCore      — Full Core (Core + MAL Core)
+        clicks      → revenueCurrent              — Core + MAL, no Media, no Data Monetisation
+      Sessions is also the only grain whose MAL leg is the network-reported
+      pro-rata figure; on the other three it is a summed bid (R019).
+      TWO OBLIGATIONS, AT EVERY GRAIN.
+      (1) State which perimeter the answer covers — whole business or Full
+      Core. R017 already requires this wherever "Core" is spoken; here it
+      applies to any unqualified revenue answer, because the grain alone has
+      already decided the perimeter and the user has not seen that happen.
+      (2) NEVER change grain to widen the perimeter. A question needing Media
+      or Data Monetisation needs sessions: offer that as a DIFFERENT question,
+      as R020 does for an out-of-window datamart, and never answer a searches,
+      impressions or clicks question off sessions instead.
+    type: default_metric
+    scope: [sessions, searches, clicks, impressions]
+    condition: null
+    notes: >
+      This rule routes; it deliberately does NOT repeat the grain-specific
+      traps, which stay where they are enforced — R001 (precision variants on
+      clicks: Current vs Ecpc vs Operational vs Actual), R021 (the
+      revenueCurrentProRataTotal decomposition, Data Monetisation, and why it
+      must not get a second name), R019 (MAL revenue on sessions is pro-rata,
+      never revenueCurrentMal).
+      revenueCurrentFullCore is a computed metric, not a column: it is
+      SUM(revenueCurrentCore) + SUM(revenueCurrentMalCore), declared for
+      searches and impressions in computed.yml.
+      The users datamart is deliberately outside this rule's scope: it carries
+      no revenue column at any perimeter, so there is nothing to route to.
+    active: true
+
+  - id: R001
+    name: Revenue default = revenueCurrent
+    description: >
+      When asked for "revenue" or "revenues" with no further specification, always use revenueCurrent. 
+    type: default_metric
+    scope: clicks
+    condition: null
+    notes: >
+      If explicitly asked for revenueOperational or revenueEcpc, reply with
+      what's been asked.
+      SCOPE IS clicks, AND MUST STAY clicks: revenueCurrent is a clicks-only
+      column. Widening this rule to sessions/searches/impressions would point
+      queries at a column that does not exist there. The per-grain mapping is
+      R022; the session-grain equivalent is R021.
+    active: true
+
+  - id: R021
+    name: Session-grain revenue default = revenueCurrentProRataTotal
+    description: >
+      An unqualified request for "revenue" or "total revenue" on the SESSIONS
+      datamart resolves to revenueCurrentProRataTotal. R001 cannot serve here
+      and must not be widened to cover it: revenueCurrent is a clicks-only
+      column and exists at no other grain, so a sessions-scoped R001 would point
+      queries at a column the table does not have. The two rules also answer
+      different questions — R001 picks the precision variant (Current vs Ecpc vs
+      Operational vs Actual), while at session grain the open question is the
+      revenue-stream perimeter, which cannot arise on a single click because a
+      click carries exactly one revenue.
+      revenueCurrentProRataTotal is already the numerator of the roasProRata
+      family, of grossProfitProRata and of ARPU, so answering a session-grain
+      revenue question with anything else silently contradicts the ROAS and ARPU
+      figures in the company's dashboards.
+      Its perimeter, summed row by row: revenueCurrentCore (Organic Core) +
+      revenueCurrentProRataMal (MAL Core + MAL Media) +
+      revenueCurrentProRataNetMedia (Display, net) +
+      revenueCurrentProRataDataMonetization. Only the first term is a
+      measurement — the other three are allocations, see
+      data/pro-rata-allocation.md.
+      Per R017, ALWAYS state explicitly that the figure is whole-business, not
+      Core.
+    type: default_metric
+    scope: sessions
+    condition: null
+    notes: >
+      DO NOT INTRODUCE A SECOND NAME FOR THIS TOTAL. The composite an analyst is
+      most likely to rebuild inline — revenueCurrentCore +
+      revenueCurrentProRataMalCore + revenueCurrentProRataMalMedia +
+      revenueCurrentProRataNetMedia — is not a distinct metric: it is exactly
+      revenueCurrentProRataTotal minus revenueCurrentProRataDataMonetization,
+      and both of those are already named in computed.yml. If a user genuinely
+      wants the total without Data Monetisation, subtract the two named metrics
+      and say which perimeter the answer covers. Naming a third near-duplicate
+      would manufacture the very two-figures-for-one-period problem it looks
+      like it solves.
+      Verified on datamart.jc_sessions_datamart_view, qualifiedSession = true,
+      businessProfile = 'jetcost' (2026-09-22): the decomposition is exact.
+      2025-11 revenueCurrentProRataTotal 771268.68 rebuilds to 771268.68 from
+      the four terms above (residual 0.0000), and revenueCurrentProRataMal
+      splits exactly into its MalCore + MalMedia legs (residual 0.0000).
+      DATA MONETISATION IS A MONTHLY ALLOCATION, which is why the distinction
+      above is worth a sentence and not a metric. It is safe by Month, Context
+      (web vs app) and business profile ONLY — a Data Monetisation figure by
+      day, country, device or campaign is the one monthly number divided
+      arbitrarily, not a breakdown (data/pro-rata-allocation.md). Its weight on
+      the total is under 1%: 0.47%-0.89% per month from 2025-09 through 2026-04.
+      So the ex-Data-Monetisation composite can never explain a material gap
+      between two "total revenue" figures for the same period. If two such
+      figures disagree by more than ~1%, the cause is elsewhere — usually R017's
+      Core vs Full Core scope, or R019's MAL leg.
+      THE FIELD READS ZERO FROM 2026-05 ONWARD, AND THAT IS AN UPLOAD GAP, NOT A
+      DEAD STREAM. Data Monetisation revenue is uploaded by hand by the media
+      team; there is no direct ingestion from the data partner. Treat a zero
+      month as missing input, never as the stream having ended, and never build
+      a trend across one.
+      MAL LEG: read R019 before reporting any MAL revenue at this grain.
+      revenueCurrentMal is a physical column on sessions and returns a plausible
+      but wrong number.
+      The pro-rata columns are exposed by datamart.jc_sessions_datamart_view
+      only — see SKILL.md 2.1, always query the view, never the base table.
+    active: true
+
+# --- DEFAULT FILTERS ---
+  - id: R002
+    name: Qualified Sessions
+    description: >
+      Always filter qualifiedSession. What qualification removes and why
+      (bots and sessions with no recorded consent state) is defined in
+      core/business/funnel.md in the domain bundle; the exact conditions
+      are on qualifiedSession in attributes.yml.
+    type: default_filter
+    scope: all
+    condition: "qualifiedSession = true"
+    notes: "If explicitly asked to not filter only qualified sessions, do not apply the filter"
+    active: true
+
+  - id: R012
+    name: Business Profile filter
+    description: >
+      Always filter businessProfile to jetcost only. businessProfile has
+      THREE values and this default excludes TWO of them: veriflights
+      (airline-only comparison, since 2026-02-24) and meta-spinner
+      (MAL-Media-only portal, since 2026-06-24). Both are separate businesses
+      at validation scale and structurally different from jetcost, so any
+      rate mixing profiles is meaningless. See core/business/business-profiles.md
+      in the domain bundle.
+    type: default_filter
+    scope: all
+    condition: "businessProfile IN ('jetcost')"
+    notes: >
+      Override if the user explicitly references other business profiles:
+      if they ask to include all profiles, drop the filter (no businessProfile
+      condition); if they ask to add one of the other two, use
+      businessProfile IN ('jetcost', '<that profile>'); if they ask for one of
+      them only, use businessProfile IN ('<that profile>').
+      When reporting this rule, name BOTH excluded profiles.
+      meta-spinner has no searches and no Core clicks by construction, so
+      every search-based metric (STR, CTR, CR) is undefined on it, not low.
+      Its websiteType is 'multi-destinations', not 'meta-spinner' — see
+      businessProfile in attributes.yml.
+    active: true
+    
+  # --- USERS DATAMART MANDATORY FILTERS ---
+  - id: R010
+    name: Users timeGrain mandatory filter
+    description: >
+      When querying jc_users_datamart, ALWAYS include a WHERE filter on timeGrain.
+      Without this filter, user counts are duplicated across Daily/Weekly/Monthly
+      and the results are MEANINGLESS.
+    type: default_filter
+    scope: users
+    condition: "timeGrain = 'Daily'"
+    notes: >
+      Default to Daily. If the user asks for weekly or monthly user counts,
+      use timeGrain = 'Weekly' or timeGrain = 'Monthly' respectively.
+      NEVER omit this filter. If the user doesn't specify, use Daily and report it.
+    active: true
+
+  - id: R011
+    name: Users step mandatory filter
+    description: >
+      When querying jc_users_datamart, ALWAYS include a WHERE filter on step
+      unless the user explicitly asks for all funnel steps.
+    type: default_filter
+    scope: users
+    condition: null
+    notes: >
+      Ask the user which step they want if not specified.
+      Steps: '01. Session Qualified', '02. Flight Search',
+      '03. Flight Impression Detail Page', '04. Flight Click Core',
+      '05. Flight Booking'.
+      If the user asks for the full funnel, use step as a GROUP BY dimension.
+    active: true
+
+# --- DEFAULT BEHAVIORS ---
+  - id: R013
+    name: Partner dimension default = partnerCode
+    description: >
+      For partner-level analysis, ALWAYS use partnerCode as the standard
+      partner dimension. NEVER use partnerBrand or partnerCodeBS: they are
+      billing-support fields (grouping/invoicing), not the standard analytical
+      partner dimension.
+    type: default_behavior
+    scope: clicks
+    condition: null
+    notes: >
+      Use partnerBrand or partnerCodeBS ONLY if the user explicitly requests
+      them (or explicitly asks for brand grouping / billing-side breakdown).
+      When a generic partner breakdown is requested, GROUP BY partnerCode.
+    active: true
+
+  - id: R014
+    name: otherOffers is a JSON array, never a plain dimension
+    description: >
+      otherOffers (impressions datamart) is an Array(Nullable(String)) where each element
+      is the JSON of one offer of the itinerary. NEVER put it in SELECT or GROUP BY as-is:
+      grouping by it yields one group per distinct offer set and the output is MEANINGLESS.
+      Always extract the single fields with assumeNotNull + JSONExtract.
+    type: default_behavior
+    scope: impressions
+    condition: null
+    notes: >
+      Two access patterns.
+      (1) OFFER-LEVEL: "ARRAY JOIN otherOffers AS offer", then
+      "JSONExtractString(assumeNotNull(offer), 'partner_code')",
+      "JSONExtractUInt(assumeNotNull(offer), 'ranking_position')",
+      "JSONExtract(assumeNotNull(offer), 'unitary_price', 'Nullable(Float64)')",
+      "JSONExtract(assumeNotNull(offer), 'baggages_info', 'checked', 'Nullable(Bool)')".
+      WARNING: ARRAY JOIN duplicates the row once per offer, so impressions, clicks and
+      every other metric of this datamart get multiplied by the number of offers.
+      NEVER sum a metric after ARRAY JOIN.
+      (2) IMPRESSION-LEVEL, metrics stay correct: use array functions without exploding, e.g.
+      "arrayExists(x -> JSONExtract(assumeNotNull(x), 'is_airline', 'Nullable(Bool)') = true, otherOffers)"
+      in WHERE, or "length(otherOffers)" as the number of other offers.
+      For a specific position use
+      "arrayFilter(x -> JSONExtract(assumeNotNull(x), 'ranking_position', 'UInt8') = N, otherOffers)[1]".
+      The hero offer is NOT in the array: for that use the hero* columns.
+      Populated only from 2026-07-01 and only for impressionType itinerary_core / itinerary_cug.
+    active: true
+
+  - id: R015
+    name: UK/GB country-code split
+    description: >
+      The United Kingdom is the ONE market that uses two different codes in two
+      different field families. NEVER use the same literal across both families,
+      and NEVER compare a field of one family against a field of the other without
+      mapping the code explicitly: it returns zero rows, or never matches,
+      SILENTLY, and for the UK only.
+      Market/user fields use 'UK': country, countryUser, firstSessionCountry,
+      firstSessionCountryUser and every appOpening*Country / appOpening*CountryUser
+      variant. On these fields 'UK' is the single non-ISO exception — every other
+      market is standard ISO 3166-1 alpha-2.
+      Route and car-geography fields use 'GB', the actual ISO code: countryFrom,
+      countryTo, pickupCountry, dropoffCountry.
+    type: default_behavior
+    scope: all
+    condition: null
+    notes: >
+      Verified on 2026-08-11 across sessions, searches, clicks, impressions and
+      users: no field ever contains both codes, so the split is per-field and
+      absolute, never per-row.
+      Consequences to apply.
+      (1) A user asking for "UK" on a route field means countryFrom = 'GB' /
+      countryTo = 'GB'; on a market field it means country = 'UK'. Translate the
+      literal to the field's own family — do NOT ask.
+      (2) countryFrom = 'UK' and country = 'GB' both return ZERO rows. If a query
+      would contain either, it is a bug: fix the literal.
+      (3) To compare across families, normalise first, e.g.
+      "if(country = 'UK', 'GB', country) = countryFrom".
+      NEVER write "country = countryFrom": it never matches for the UK.
+      (4) The computed dimension "Country Route" yields 'GB-xx' / 'xx-GB' for the
+      UK, never 'UK-xx'. Same for "Sub-Continent - From" / "Sub-Continent - To",
+      whose dictGet lookups are keyed on countryFrom / countryTo.
+      (5) When a query mixes the two families, report the mapping applied.
+    active: true
+
+  - id: R016
+    name: Geography fields are product-scoped, never interchangeable
+    description: >
+      Origin/destination geography lives in DIFFERENT columns per product vertical.
+      NEVER substitute one for another because the column name looks right: an
+      empty or wrong-product field returns NULLs or zero rows SILENTLY, with no error.
+      Flight and DP (`product` IN ('FLIGHT','DP')) → countryFrom / countryTo,
+      plus iataFrom/iataTo, continentFrom/continentTo and haulTypeDistanceCustom.
+      Car (`product` = 'CAR') → pickupCountry / dropoffCountry, pickupIata /
+      dropoffIata, pickupContinent.
+    type: default_behavior
+    scope: [searches, clicks, impressions]
+    condition: null
+    notes: >
+      Verified on 2026-08-11 over the full history (2019-01-01 → 2026-08-10).
+      (1) countryTo / countryFrom are NULL for CAR, and pickupCountry /
+      dropoffCountry are NULL for FLIGHT and DP. Cross-product geography queries
+      must therefore branch on product, not coalesce the columns.
+      (2) DP does NOT have its own geography columns: its origin/destination are in
+      countryFrom / countryTo like flights (58,584 of 58,584 searches populated).
+      (3) On the CLICKS datamart, route geography exists only for Core clicks.
+      countryTo is filled on 98.5% of Core FLIGHT clicks
+      (clickCategoryMacroType = 'Core', i.e. clickCategory IN (1001, 5001)) but is
+      essentially absent on MAL clicks — 0.0% on 2003, 2.1% on 4002, 0% on
+      2001/2002/3002/4001 — because a MAL click is an ad unit, not an itinerary
+      clickout, and carries no route. MAL Core Promobox (3003) is the partial
+      exception at 77.3%.
+      Consequence: a route-level breakdown on clicks MUST filter to Core clicks.
+      Unfiltered, the aggregate collapses to ~40% coverage and the breakdown
+      silently omits most rows — that number is an artifact of mixing click types,
+      NOT a data-quality problem with countryTo.
+    active: true
+
+  - id: R017
+    name: Always disambiguate "Core" vs "Full Core"
+    description: >
+      "Core" is overloaded across this semantic layer, not just on ROAS.
+      As a field-name component (clicksCore, revenueCurrentCore,
+      revenueEcpcCore, revenueOperationalCore) it means Organic Core ONLY,
+      excluding MAL Core. As a business macro-category
+      (core/business/revenue-streams.md) and as the domain glossary's
+      "Full Core Clicks" volume (data/metrics.md), the same word covers
+      Organic Core + MAL Core — what this skill calls "Full Core"
+      wherever a metric distinguishes the two (e.g. "ROAS Pro Rata - Full
+      Core" in computed.yml, Core + MAL Core, vs the whole-business
+      roasProRata family, which despite "revenueCurrentCore" in some of
+      its aliases actually includes MAL + Media + Data Monetisation too).
+      NEVER answer a question mentioning "Core" revenue, clicks, or a
+      derived metric (ROAS, eCPC, RPMS, Mix CPC/CPA...) without stating
+      explicitly which of the two scopes the number covers. Ask the user
+      to disambiguate if it's not clear which one they mean, rather than
+      guessing.
+    type: default_behavior
+    scope: all
+    condition: null
+    notes: >
+      Worked example on ROAS specifically — where the two scopes are
+      decision-changing, not just a rounding difference — in
+      core/marketing/sem/metrics.md's "Two ROAS numerators" section
+      (paid-search 2026-07-17 to 2026-08-15: desktop 115.7% whole-business
+      vs 88.5% Full Core; on FR desktop crosses the 100% ROAS bid target
+      in opposite directions depending on which scope is used, 130% vs
+      85%). Field-naming trap: Full Core's MAL leg is
+      revenueCurrentProRataMalCore, NOT revenueCurrentMalCore —
+      revenueCurrentMalCore is a direct column on searches and impressions
+      (NOT on clicks, and NOT on sessions — the datamart the ROAS family
+      runs on). Using it there is a silent modeling error, not a query
+      failure. See the availability matrix in attributes.yml's METRIC
+      BUILDING BLOCKS block for which grain carries which MAL leg.
+    active: true
+
+# --- DEFAULT EXCLUSIONS ---
+  - id: R018
+    name: Exclude automatic searches
+    description: >
+      An automatic search (autosearch) is a search re-issued by the platform
+      itself — session expired, deeplink not resolved, search replayed from the
+      DB — not a search the user submitted. It is not user demand and must never
+      be counted as such: on the searches datamart, ALWAYS filter
+      automaticSearch = false.
+    type: default_exclusion
+    scope: searches
+    condition: "automaticSearch = false"
+    notes: >
+      Override only if the user explicitly asks to include autosearches, or to
+      analyse them (then use automaticSearch = true) — and report the override.
+      Size of what is being excluded, verified 2026-09-02: 6-9% of searches from
+      2025 through 2026-03, spiking to ~24% in April-May 2026, back to 6-7% since
+      July. Large enough to create or hide a trend on its own, so NEVER compare a
+      filtered period against an unfiltered one.
+      FILTER ON THE FLAG, NEVER ON automaticSearchReason. The reason strings are
+      not stable over history: today 'not_applicable' pairs with false, and
+      inactivity_timeout / empty_sid / search_from_db / deeplink_not_found /
+      search_from_url / ssid_expired / ssid_expired_polling / invalid_search pair
+      with true — but before mid-2026 both sides also carry 'unknown', and true
+      additionally carries the legacy 'auto_search', 'sid_expired',
+      'sid_expired_polling' and 'inactivity_timeout?_'. The boolean is
+      authoritative, the string is not.
+      searchesBlocked TRAP. automaticSearch is Nullable(Bool), and its NULL rows
+      are exactly the blocked-search rows (automaticSearchReason = '',
+      searches = 0, present from 2026-06-09). SQL drops NULL on "= false", which
+      is lossless for every search count — but it also removes 100% of
+      searchesBlocked. When searchesBlocked is in the SELECT, use
+      "ifNull(automaticSearch, false) = false" instead: same exclusion, blocked
+      rows kept. Write it exactly like that — ClickHouse accepts IS NULL /
+      IS NOT NULL and nothing else after IS, so an "IS NOT true" form is a
+      SYNTAX_ERROR, not a valid alternative.
+      SCOPE IS searches, DELIBERATELY — do NOT copy this filter to clicks or
+      impressions. On clicks, automaticSearch IS NULL on ~51% of the rows
+      (August 2026) and 99% of those are Mal Media clicks — an ad unit has no
+      search behind it — so "automaticSearch = false" there silently drops all
+      but 0.8% of MAL Media clicks and their revenue. If a click-side exclusion
+      is genuinely wanted, use "ifNull(automaticSearch, false) = false" and say
+      so.
+      CONSISTENCY WITH sessions — the reason this rule matters beyond correctness.
+      The sessions datamart already excludes autosearches upstream: its build
+      query filters them with "autosearchId IS NULL AND toBool(autoRelaunch) =
+      false", so searches / searchesFlight / searchesCar there, and every metric
+      built on them (STR, CTR Core, LTB and their product variants), are
+      autosearch-FREE by construction. There is nothing to apply on sessions —
+      automaticSearch is a search-grain dimension and does not exist there — and
+      nothing to warn about either. Applying this rule to the searches datamart is
+      precisely what keeps the two sides comparable: on 2026-04 → 2026-08, with
+      qualifiedSession and businessProfile filtered on both sides, the filtered
+      searches count reconciles with the sessions one to within 0.06-0.12%
+      (sessions marginally lower — the two definitions are built from different
+      fields, so a small residual is expected, not a bug), while the UNfiltered
+      count runs 5.9-7.1% higher and reconciles with nothing. A searches-datamart
+      figure quoted without this filter will therefore contradict the STR and CTR
+      of the same period.
+    active: true
+
+  - id: R019
+    name: MAL revenue on sessions = pro-rata, never the click-summed bid
+    description: >
+      On the sessions datamart, MAL revenue must be read from the pro-rata
+      columns — revenueCurrentProRataMal and its revenueCurrentProRataMalCore /
+      revenueCurrentProRataMalMedia legs — NEVER from revenueCurrentMal. The two
+      are different facts wearing the same prefix: revenueCurrentProRata* comes
+      from the MAL network revenue report, which is what revenue reporting means
+      by MAL revenue, while revenueCurrentMal is the sum of the winning bids
+      recorded on the clicks — on a MAL click revenueCurrent is set equal to
+      revenueEcpc by construction, so it is a price, not consolidated revenue.
+      See data/revenue-fields.md's "MAL revenue: three representations, one
+      name" for the full lineage.
+    type: default_metric
+    scope: sessions
+    condition: null
+    notes: >
+      revenueCurrentMal IS still a physical column on
+      datamart.jc_sessions_datamart, so a query using it succeeds and returns a
+      plausible number — this rule is the only thing between an agent and a
+      wrong one. It has been deliberately REMOVED from the Superset sessions
+      dataset and replaced there by revenueCurrentProRataMal, precisely to kill
+      this ambiguity: a figure built on revenueCurrentMal is not reproducible by
+      anyone reading the company's dashboards.
+      Size of the gap, verified on datamart.jc_sessions_datamart_view,
+      2026-08-25, qualifiedSession = true, both figures off the same rows:
+      revenueCurrentMal 4321.28 (bids) vs revenueCurrentProRataMal 4654.57
+      (network-reported), +7.7%. The pro-rata legs decompose exactly —
+      MalCore 2746.11 + MalMedia 1908.46 = 4654.57.
+      revenueEcpcMal and revenueOperationalMal are NOT covered by this rule and
+      stay available: their names promise a bid/eCPC-based figure and that is
+      what they carry. Use them for auction and placement questions ("what did
+      this click cost the buyer", "who won this exit unit"), never as MAL
+      revenue.
+      CONSEQUENCE FOR FULL CORE. Full Core revenue exists in the Current
+      variant ONLY, at every grain: the entire family is
+      revenueCurrentFullCore (searches) and revenueCurrentProRataFullCore
+      (sessions). There is NO revenueEcpcFullCore and NO
+      revenueOperationalFullCore — nowhere, at no grain — because the MAL Core
+      leg they would need does not exist either: only revenueCurrentMalCore
+      does (see the availability matrix in attributes.yml). Do not construct
+      one on the fly.
+      NAMING TRAP, given the paragraph above: the "eCPC Full Core" metrics are
+      a ratio — revenue over Full Core clicks — and BOTH of their flavours are
+      built on revenueCurrent. The "eCPC" in that name is the metric, not the
+      revenueEcpc field.
+      The two Current variants are not interchangeable either: the searches one
+      takes its MAL leg from revenueCurrentMalCore (bids summed per search),
+      the sessions one from revenueCurrentProRataMalCore (network-reported,
+      allocated). Both are correct for their grain, they do NOT reconcile with
+      each other, and must never be summed or compared as one series.
+      SCOPE IS sessions. On searches there is no pro-rata alternative at all —
+      revenueCurrentMalCore / revenueCurrentMalMedia are the only MAL split
+      available there, and they are bids. Note also that MAL Media on the
+      searches datamart is the inline unit alone (R023), so a per-search
+      "MAL Media" figure is not MAL Media at all.
+    active: true
+
+  - id: R023
+    name: MAL Media on searches and impressions = the inline unit only
+    description: >
+      On the searches datamart every MAL Media column (clicksMalMedia,
+      revenueCurrentMalMedia and their product variants) carries the INLINE
+      unit (clickCategory 3006) and nothing else. The exit unit (4002), ~99%
+      of MAL Media clicks, fires outside a search and never attaches to one;
+      neither does the checkbox (2003). On impressions the MAL Media columns
+      are exactly zero. Neither case fails: the query returns a plausible
+      number covering only the inline share, about 1% of MAL Media clicks.
+      NEVER present a searches or impressions MAL Media figure as MAL Media.
+      For MAL Media totals, rates or RPMS use sessions (pro-rata columns,
+      R019) or clicks (clickCategory). An inline-specific question IS
+      answerable on searches: answer it, and call it the inline unit.
+      Consequence for unsuffixed MAL on searches: revenueCurrentMal and
+      clicksMal there are MAL Core plus the inline unit, not total MAL (on
+      impressions, MAL Core alone).
+    type: default_behavior
+    scope: [searches, impressions]
+    condition: null
+    notes: >
+      Verified 2026-10-01. Every month from 2025-07 to 2026-09 the searches
+      datamart's clicksMalMedia matches the inline clicks that carry a search
+      on datamart.jc_clicks_datamart to within a few dozen clicks (2026-09:
+      12,648 vs 12,648), and 4002 clicks with a search are 0 from 2025-09
+      (7,084 of 2.86M in 2025-06, then 41 and 5). 2026-09, businessProfile =
+      'jetcost': clicksMalMedia 11,916 on searches vs 1,511,901 on sessions
+      (0.79%). Impressions: clicksMalMedia and revenueCurrentMalMedia are 0 in
+      every month of the datamart's window.
+    active: true
+
+  - id: R020
+    name: Data availability floor — verify BEFORE building a historical query
+    description: >
+      Every datamart has a first date, and one of them has a MOVING one.
+      Before writing any query whose window starts more than a few months
+      back, check the requested start date against the floor below.
+      Out-of-window data does NOT raise an error: the query succeeds and
+      returns zero rows, or a series silently clipped at the floor — which
+      reads as a traffic collapse that never happened, on a datamart that
+      is simply not there for that period.
+        sessions / searches / clicks → 2019-01-01 (fixed start date)
+        users                        → 2024-01-01 (fixed start date)
+        impressions                  → ROLLING: last 6 full months + the
+                                       current month. NOT a start date.
+      If the requested window starts before the applicable floor, STOP and
+      say so BEFORE running anything.
+    type: default_behavior
+    scope: all
+    condition: null
+    notes: >
+      NEVER HARDCODE THE IMPRESSIONS FLOOR. It moves forward every month, so
+      any date written into a file or a prompt is wrong by the first of the
+      next month. Compute it:
+      "toStartOfMonth(addMonths(today(), -6))". Verified 2026-09-10: formula
+      yields 2026-03-01, actual min(date) on datamart.jc_impressions_datamart
+      = 2026-03-01, max = 2026-09-09. If a request sits within a few days of
+      the computed floor, verify against the table itself
+      ("SELECT min(date) FROM datamart.jc_impressions_datamart") rather than
+      trusting the formula, since the drop runs on its own schedule.
+      THREE CASES, THREE DIFFERENT ANSWERS — do not collapse them.
+      (1) Window entirely before the floor → the analysis is IMPOSSIBLE.
+      Say so explicitly, state the floor, and STOP. Do not run the query "to
+      show it's empty".
+      (2) Window straddling the floor → do NOT silently clip. State the
+      effective window that CAN be covered, say what is being lost, and ask
+      whether to proceed on the shorter period. A period-over-period
+      comparison with one side clipped is not a smaller answer, it is a
+      wrong one.
+      (3) Window entirely inside → proceed, and do not report this rule.
+      NEVER SUBSTITUTE ANOTHER DATAMART. When impressions are out of window,
+      clicks are NOT a fallback: they are a sibling at a different grain
+      (§2.2), measuring offers clicked rather than itineraries displayed.
+      Offer the clicks-based question as a DIFFERENT question the user may
+      or may not want, never as the same analysis on another table.
+      NOT OVERRIDABLE — this is the exception to the override convention in
+      SKILL.md §5 Step 3. A user restating the request, or explicitly asking
+      to run it anyway, does not make absent rows exist. Every other rule in
+      this file yields to the user; this one cannot.
+      ZERO ROWS OUT OF WINDOW IS NOT AN INCIDENT. Do not report it as a data
+      gap, do not open it as a pipeline question, and do not retry.
+      ROW PRESENCE IS NOT COLUMN PRESENCE. A date inside the window still
+      does not guarantee the columns existed then — many are far more recent
+      than the datamart itself (on impressions: otherOffers is an empty array
+      before 2026-07-01, isSelfTransfer is web-only since 2026-06-25, minCpc
+      since 2026-05-01). Clearing this rule is necessary, not sufficient:
+      check the per-column availability notes in attributes.yml as well.
+      REFERENCE ATTRIBUTES HAVE NO HISTORY. Partner, campaign and market
+      registries are truncate-and-reload, so a breakdown of an old period is
+      labelled with TODAY's registry — renamed campaigns under their new
+      name, current deals on historical rows, upstream deletions
+      unresolvable. Flag this whenever a historical breakdown groups by a
+      reference dimension.
+    active: true
+
+  # --- KNOWN DATA INCIDENTS ---
+  - id: R024
+    name: Known data incidents — check data-incidents.yml on every overlapping period
+    description: >
+      data-incidents.yml lists the periods in which data in ClickHouse is
+      missing, incomplete or wrong because something broke upstream, what is
+      still wrong and what was recovered. An incident applies to a request
+      when ALL THREE overlap:
+        - dates: the request's window and the incident's period;
+        - datamart: the one queried is in the incident's scope.datamarts
+          (all = any of them);
+        - rows: the request can include the incident's scope.where — it
+          filters on those values, breaks down by them, or is a total that
+          does not exclude them ({} = every row).
+      When an incident applies, the answer MUST carry it:
+        - a question on WHY a number looks low, zero or odd → the incident is
+          the first explanation to rule in or out: cite its id, period and
+          cause before any other hypothesis;
+        - a metric in still_wrong → say it is incomplete or missing for that
+          scope and period, and NEVER read it as a change in performance or
+          traffic. A period with no data at all is not a low value: leave it
+          out of averages, trends and comparisons, or flag it, and say which;
+        - a metric in recovered → a closing footnote with the period and how
+          it was recovered, valid down to the grain the entry states.
+    type: default_behavior
+    scope: all
+    condition: null
+    notes: >
+      Status open or recovery_pending means the figures will still change:
+      say so when the answer depends on them.
+      A comparison where only one side overlaps an incident is skewed in that
+      direction: say which side, and by how much when the entry's evidence
+      allows it.
+      In a total that does not filter out the incident's scope.where, the
+      incident is diluted, not gone: keep the footnote short, but keep it.
+      A breakdown below the grain an entry states for its recovered figures
+      shows them spread evenly, not where they really were: say so when the
+      answer rests on that breakdown.
+      Report it as "R024 (I001)" in the applied-rules list, one id per
+      incident that applied. When no incident applies, do not report it.
+    active: true

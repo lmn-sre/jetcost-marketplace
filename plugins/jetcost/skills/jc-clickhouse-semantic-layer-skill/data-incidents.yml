@@ -1,0 +1,99 @@
+# ═══════════════════════════════════════════════════════════════════
+# DATA INCIDENTS
+# Periods in which data in ClickHouse is missing, incomplete or wrong
+# because something broke upstream — a partner feed, a source system, a
+# pipeline, a tracking change — what is still wrong because of it, and what
+# was recovered. Applied through rule R024 in query-rules.yml.
+#
+# Not incidents, and not listed here: dates outside a datamart's window
+# (R020), columns that did not exist yet (attributes.yml), the normal CPA
+# reporting lag of the most recent days (domain bundle,
+# data/query-caveats.md). Those are documented where they are enforced.
+#
+# Maintained by hand by the data team: add an entry as soon as an incident
+# is confirmed, update it as the recovery goes on, and push. Never delete an
+# entry: a recovered incident still explains its period.
+#
+# Format:
+#   - id:          unique incident code (I001, I002, …)
+#     name:        one line
+#     status:      open             — data missing or wrong, no recovery planned yet
+#                  recovery_pending — a recovery is planned (data expected, a
+#                                     rerun scheduled), not applied yet
+#                  recovered        — recovery applied; still_wrong lists
+#                                     what it could not restore
+#                  lost             — will not be recovered
+#     period:      first and last affected date, both inclusive, on the date
+#                  each datamart is keyed on
+#     cause:       what broke, in a line or two
+#     scope:
+#       datamarts: all, or a list of sessions, searches, clicks,
+#                  impressions, users
+#       where:     dimension → affected values, with the dimension names of
+#                  attributes.yml, combined with AND; {} = every row of those
+#                  datamarts. Finer detail goes in still_wrong.
+#     still_wrong: what is wrong or missing in the datamarts today
+#     recovered:   what was restored, how, and down to which grain it holds
+#     evidence:    figures that let an answer state the size of the gap
+#     verified:    date and what was checked
+#     reference:   ticket
+# ═══════════════════════════════════════════════════════════════════
+
+incidents:
+
+  - id: I001
+    name: ODIGEO — app and mobile-web conversions missing from the Partners-Hub feed
+    status: recovered
+    period:
+      from: 2026-10-07
+      to: 2026-10-13
+    cause: >
+      ODIGEO's Conversion API feed (groupBookingAvailability = CONV_API)
+      stopped delivering most app and mobile-web conversions. A Conversion-API
+      group gets no eCPC fallback, so while the feed was broken revenueCurrent
+      carried only the conversions that did arrive.
+    scope:
+      datamarts: all
+      where:
+        groupCode: [ODIGEO]
+    still_wrong: >
+      Conversion counts from app and mobile web (desktop conversions kept
+      arriving): app ones dropped from the morning of 2026-10-07, mobile-web
+      ones from 2026-10-08; both stayed close to zero until 2026-10-12 and
+      were about half back on 2026-10-13. They are NOT recovered: the
+      conversions columns on every datamart (conversions, conversionsFlight,
+      conversionsCar), the users step "05. Flight Booking", and every metric
+      computed from them — CR, CR Core, LTB. commissionValueCalculated is NOT
+      recovered either, so eCPC Conversions is understated too.
+    recovered: >
+      revenueCurrent and revenueOperational, and every revenue metric built
+      on them (revenueCurrentCore, revenueCurrentProRataTotal, ARPU, …). On
+      2026-10-20 ODIGEO sent its own commission per click date × brand ×
+      country × device (298 rows, 13,110 EUR); each figure was spread in
+      equal parts over the CPA Core clicks of its cell, replacing the
+      Partners-Hub revenue on every device, desktop included. It holds at
+      that grain and above; below it (route, campaign, search, session)
+      ODIGEO's revenue is spread evenly over the clicks, not placed where the
+      bookings were. Why the bookings are not restored: domain bundle,
+      data/revenue-fields.md, "When the missing data is recovered".
+    evidence:
+      # conversions by click date: received from Partners-Hub / reported by
+      # ODIGEO (Partners-Hub counts as of 2026-10-20)
+      - { date: 2026-10-07, app: 76/85, mobileWeb: 25/25, desktop: 53/39 }
+      - { date: 2026-10-08, app: 13/97, mobileWeb: 7/24, desktop: 42/46 }
+      - { date: 2026-10-09, app: 6/86, mobileWeb: 5/34, desktop: 29/27 }
+      - { date: 2026-10-10, app: 4/91, mobileWeb: 5/32, desktop: 29/27 }
+      - { date: 2026-10-11, app: 2/75, mobileWeb: 6/31, desktop: 15/15 }
+      - { date: 2026-10-12, app: 4/80, mobileWeb: 4/27, desktop: 35/35 }
+      - { date: 2026-10-13, app: 49/92, mobileWeb: 13/23, desktop: 41/43 }
+      # ODIGEO CPA Core revenue on the 7 days: 6,034 EUR before the recovery,
+      # 13,284 EUR after (174 EUR of it from conversions in cells the report
+      # did not cover). From 2026-10-14 the feed carries tens of conversions
+      # a day again: app 71–109, mobile web 20–39 on 14–20 October, against
+      # 90–124 and 23–41 on 30 September–6 October.
+    verified: >
+      2026-10-22: the revenue applied equals the 13,110 EUR loaded, on every
+      day; jc_clicks_datamart, meta_overall_datamart and
+      meta_overall_no_media_datamart match to the cent; sessions and searches
+      carry it too, apart from their usual date-attribution offsets.
+    reference: ClickUp 1244errpvzc

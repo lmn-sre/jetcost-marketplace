@@ -1,0 +1,2165 @@
+# ============================================================
+# GLOSSARY — read this to understand column naming conventions
+# ============================================================
+# Columns are COMPOSITIONAL. Most follow the pattern:
+#   [scope_prefix] + [campaign_layer] + BaseAttribute
+#
+# Example: firstAppOpeningFirstWebSessionCampaignCampaignType
+#   = firstAppOpeningFirstWeb (scope) + sessionCampaign (campaign) + CampaignType (attr)
+#
+# --- ATTRIBUTION MODELS --------------------------------------
+# Three models to attribute traffic (each ends with "Campaign" in column names):
+#   sessionCampaign        → in-session attribution (current session)
+#   userBasedCampaign      → custom in-house user-level attribution
+#   lastClickNotDirectCampaign → standard last non-direct click attribution
+#
+# In-session model has two channels:
+#   sessionCampaign → marketing channel (paid ads, SEO, direct, etc.)
+#   sessionContent  → product channel (internal content-driven traffic)
+#     same sub-attributes as sessionCampaign but without "Campaign" in the name
+#     (e.g., sessionContentChannelGroup, not sessionContentCampaignChannelGroup)
+#
+# Each channel has the same sub-attributes, derived from internal
+# "anagrafica marketing" tool (cascading taxonomy):
+#   PaidVsNotPaid → paid vs free (binary, highest level)
+#   ChannelGroup  → high-level grouping (paid-search, organic, direct, social, ...)
+#   TrafficType   → mid-level breakdown
+#   CampaignType  → most granular classification (brand, generic, remarketing, ...)
+#   + Source, Medium, IsOia, LocalVsExt, CountryDetail, Product
+#
+# Source and Medium are read from the same campaign registry as the other
+# sub-attributes. Their former *SourceInternal / *MediumInternal twins (e.g.
+# sessionCampaignSourceInternal, userBasedCampaignMediumInternal) were retired
+# on 2026-09-29 (ClickUp 1244errmn2g): never query them, even while the
+# physical columns are still on the tables — use *Source / *Medium instead.
+#
+# --- TEMPORAL PREFIXES ---------------------------------------
+# firstSession → user's very first session (lifetime)
+#   Applied to any attribution or dimension to get its "first-ever" value.
+#
+# --- TEMPORAL DIMENSIONS (date granularities) ----------------
+# The primary key is `date` (daily). For non-daily aggregations use
+# (formats checked against the tables on 2026-10-13):
+#   year           → e.g., 2025
+#   quarter        → quarter number (1-4)
+#   yearQuarter    → UInt32 year*100 + quarter, e.g., 202501 = 2025 Q1 (not '2025-Q1')
+#   month          → month number (1-12)
+#   yearMonth      → UInt32 YYYYMM, e.g., 202501 (not '2025-01')
+#   week           → Sunday-based week number (1-53), NOT ISO: Monday
+#                    2026-10-05 is week 40 here and ISO week 41
+#   yearWeek       → UInt32 YYYYWW, Sunday-based (WEEK CONVENTION in SKILL.md),
+#                    e.g., 202640. The week across 1 January goes to the year
+#                    holding at least 4 of its days, so the YYYY can differ from
+#                    year(date) both ways: 2026-01-01 → 202553, 2024-12-29 → 202501
+#   weekDay        → lowercase day name ('sunday', 'monday', ...)
+#   weekDayNumber  → 0=Sunday, 1=Monday, ... 6=Saturday
+#
+# ⚠️ There is NO startOfWeek column on any of the five datamarts. For the date
+#    the week starts on, use toStartOfWeek(date, 6): mode 6 starts on Sunday
+#    and maps one-to-one onto yearWeek (checked on every week 2019 → 2026).
+# Not every granularity is on every datamart — weekDay and weekDayNumber are
+# absent from users. Each datamart's `dimensions` list below is the reference.
+#
+# The scope prefixes carry Date, Year, Quarter, YearQuarter, Month, YearMonth,
+# Week and YearWeek only (no WeekDay / WeekDayNumber), on sessions, searches,
+# clicks and impressions:
+#   firstSession*         → e.g., firstSessionYearMonth
+#   userBasedFirst*       → e.g., userBasedFirstYear
+#   appOpeningWeb*        → e.g., appOpeningWebQuarter
+#   (and all other cross-device prefixes)
+#
+# --- CROSS-DEVICE PREFIXES (W2A = web-to-app) ----------------
+# Handle users switching between app and web.
+#   appOpeningWeb              → current web session after current app opening
+#   appOpeningFirstWeb         → first web session after current app opening
+#   firstAppOpeningWeb         → current web session after first-ever app opening
+#   firstAppOpeningFirstWeb    → first web session after first-ever app opening
+#
+# --- METRIC BUILDING BLOCKS ----------------------------------
+# Revenue has three dimensions:
+#
+# Revenue stream (business line):
+#   Core      → core CPC/CPA revenues (flight comparison clicks)
+#   MalCore   → MAL tool revenues competing with core offers (same placement)
+#   MalMedia  → MAL tool revenues on dedicated media placements (checkbox, inline ads, etc.)
+#     ⚠️ The MalCore/MalMedia split is derived from clickCategory during the ETL
+#        (1001 = Core, 3003 = Mal Core, everything else = Mal Media) and is NOT
+#        uniformly available. Verified against system.columns:
+#          clicksMalCore / clicksMalMedia          → searches, sessions, impressions
+#          revenueCurrentMalCore / ...MalMedia     → searches, impressions ONLY
+#          revenueCurrentProRataMalCore            → sessions (view), pro-rata allocated
+#          revenueEcpc* / revenueOperational*      → NO MalCore/MalMedia split at all,
+#                                                    only the combined Mal
+#        So on sessions the MAL Core clicks are a real count, while the MAL Core
+#        revenue is available only in its pro-rata form.
+#        The unsuffixed Mal columns (revenueCurrentMal, revenueEcpcMal,
+#        revenueOperationalMal) DO exist at every grain — they are MalCore +
+#        MalMedia combined, which on searches is in practice MAL Core plus the
+#        inline unit: the exit unit never has a search to attach to, the
+#        inline essentially always does (R023 in query-rules.yml).
+#        Do not assume the three precision variants agree on a MAL aggregate: they coincide per click, but not once summed
+#        to session grain.
+#        ⚠️ On sessions, MAL revenue is revenueCurrentProRataMal — NOT
+#        revenueCurrentMal, which is present in the table but is a sum of click
+#        bids, and has been removed from the Superset dataset. See R019 in
+#        query-rules.yml before reading any MAL revenue at session grain.
+#        And none of these columns exist on jc_clicks_datamart: that datamart
+#        carries raw clickCategory instead, so filter on it there.
+#   Media     → display advertising via GAM/AFS/similar ad-serving tools
+#   Mal       → MalCore + MalMedia combined
+#   (no suffix) → all streams combined
+#
+# Precision vs speed (from fastest to most accurate):
+#   Ecpc        → calculated via ECPC calculator
+#   Operational → sent to marketing in real-time (commissionValue for CPA partners if available, ecpc otherwise)
+#   Current     → delayed 1-2 days, more accurate
+#   Actual      → derived from invoicing (most accurate, slowest)
+#   ⚠️ The ladder is a CORE fact. On a MAL click (clickCategory != 1001) the
+#      variants carry the same value: revenueCurrent = revenueOperational on
+#      every click, and = revenueEcpc from 2025-12-01 (before that, a 1-cent
+#      per-click rounding difference on under 1% of MAL clicks). So on MAL,
+#      Current is not more accurate than Ecpc — it is the winning bid. The
+#      network-reported MAL figure is the pro-rata one on sessions (R019).
+#
+# Product vertical (suffix in METRIC NAMES, e.g. searchesFlight, amc3DynamicPackage):
+#   Flight, Car, DynamicPackage → specific product
+#   (no suffix) → all products combined
+#   ⚠️ These spellings are metric-name suffixes ONLY. The `product` COLUMN uses
+#      different literals — see its entry under KEY DIMENSIONS below.
+#
+# Model suffixes:
+#   ModelCpc     → CPC commission model only
+#   ModelCpa     → CPA commission model only
+#   (no suffix)  → all models combined
+#
+# Cumulative metrics:
+#   CumulativePerUser    → revenue accumulated across user lifetime
+#   CumulativePerSession → revenue accumulated within a session
+#   CumulativePerSearch  → revenue accumulated within a search
+#
+# --- KEY DIMENSIONS (with enum values) -----------------------
+# country: 2-char market code
+#   values: [AR,AT,AU,BO,BR,CA,CL,CO,DE,DK,ES,FI,FR,HK,HU,ID,IE,IN,IT,KR,MX,MY,NL,NO,NZ,PE,PH,PL,PT,RO,RU,SE,SG,TH,UK,US,UY,VE,ZA]
+#   ⚠️ UK is the single non-ISO value: the UK market is 'UK' here, but 'GB' on the
+#      route/car fields (countryFrom, countryTo, pickupCountry, dropoffCountry).
+#      country = 'GB' returns ZERO rows. See R015 in query-rules.yml.
+#      Same code space, same caveat: countryUser, firstSessionCountry,
+#      firstSessionCountryUser, appOpening*Country, appOpening*CountryUser.
+#   ⚠️ RU is decommissioned: no rows after 2026-07-06. A window spanning that
+#      date shows it starting and stopping — a decommissioning, not a gap.
+# region: GEOGRAPHIC grouping of countries, by continent — NOT the business lens
+#   values: [AFRICA, APAC, EMEA, LATAM, NORAM]
+#   ⚠️ A request for "macroarea" / "macro-area" / "macro area" means macroArea
+#      below, NEVER region. Use region only when the question is explicitly
+#      geographic (continent). The two disagree on several markets: MX is
+#      NORAM here but Rest of the World in macroArea; UK is EMEA here but
+#      English speaking there; AU/NZ are APAC here but English speaking there.
+#   Not the same thing as the macro-region in SEM campaigns' GEO field either,
+#   which groups route origins/destinations, not markets.
+# macroArea: the BUSINESS grouping of markets — how Jetcost observes the business
+#   values: [English speaking, Europe, Rest of the World]
+#   English speaking  = US, CA, UK, AU, NZ
+#   Europe            = every European market except UK — IE included, even
+#                       though it is English-language
+#   Rest of the World = LATAM, MX, APAC except AU/NZ, ZA, RU
+#   Same code space and same caveat on the prefixed variants (firstSession*,
+#   appOpening*, firstAppOpening* ...MacroArea).
+# businessView: macroArea with the six main markets split out
+#   values: [TOP 6 - English speaking, TOP 6 - Europe, English speaking, Europe,
+#            Rest of the World]
+#   TOP 6 - English speaking = US, UK; TOP 6 - Europe = IT, FR, ES, DE; every
+#   other market keeps its macroArea value. Rolls up exactly into macroArea.
+# region, macroArea and businessView all come from the same per-country
+# dictionary (config.dict_country), written as physical columns by the ETL:
+# one value per country, never per session.
+# language: 2-char code
+#   values: [da,de,en,es,fi,fr,hu,it,ko,nb,nl,pl,pt,ro,ru,sv]
+#   ⚠️ Norway is 'nb' (Bokmål), never 'no'. Denmark 'da', Sweden 'sv'.
+#   ⚠️ country and language are NOT independent: a market is the (country,
+#      language) tuple, and only 40 of the 38x15 combinations exist. Every
+#      country has exactly ONE language except CA (en + fr) and US (en + es),
+#      where the second is ~48% and ~41% of the market and has materially
+#      different paid economics. Grouping US or CA by country alone merges two
+#      segments that should be read apart — always add language for those two.
+#      See core/business/markets.md in the domain bundle.
+# businessProfile → websiteType → website: three NESTED fields, widest first —
+#   the business model, the property layer inside it, the single property.
+#     businessProfile  websiteType          website
+#     jetcost          jetcost              jetcost             (core site, ALL markets)
+#                      whitelabel           one value per white-label domain
+#                      app                  jetcost-mobile-app  (ALL markets)
+#     veriflights      veriflights          veriflights         (since 2026-02-24)
+#     meta-spinner     multi-destinations   multi-destinations  (since 2026-06-24)
+#   Same values on every datamart, except impressions, which carries the
+#   jetcost profile only. Default scope is jetcost only (R012).
+#   On searches only, ~15k searches since 2023 carry all three fields (and
+#   country) empty; R012 drops them, which is correct.
+#   ⚠️ website NEVER splits the core site or the app by market: every
+#      per-market domain collapses into 'jetcost'. Use country. Only
+#      white-label rows carry one value per domain.
+#   ⚠️ websiteType = 'app' and context = 'app' are EXACTLY the same set
+#      (verified 2023-01 → 2026-09), so websiteType only refines the web side.
+#      For web vs app use context.
+#   ⚠️ A profile's name is not its websiteType: meta-spinner is
+#      'multi-destinations', so websiteType = 'meta-spinner' returns ZERO rows.
+#   See data/dimensions.md and core/business/whitelabels.md in the domain bundle.
+# context: web vs app
+#   values: [app, web]
+# platform: os-level
+#   values: [android, ios, web]
+# deviceType: high-level device cluster (tablet/connected_tv → desktop)
+#   values: [app, desktop, mobile]
+# qualifiedSession: boolean, the session filter every metric runs on (R002)
+#   values: [true, false]
+#   Business definition (what qualification removes and why): core/business/funnel.md
+#   in the domain bundle.
+#   Business profiles other than jetcost (veriflights, meta-spinner): always true.
+#   jetcost: true when the session has a ga_client_id or Argo tracked at least one
+#   page/screen view, except two cases where no Argo event of the session carries a
+#   Tech consent (consentsTech), both from 2025-01-01:
+#     - direct sessions, first or returning;
+#     - the user's first session from referral or organic-search. Added on 2026-10-08
+#       and restated back to 2025-01-01 by the October 2026 re-run.
+#   ⚠️ Comparisons across 2025-01-01 mix two definitions. The referral / organic-search
+#      exclusion alone is ~2.4% of jetcost qualified sessions in 2025 and ~2.7% in
+#      Jan-Aug 2026, but about a third of organic-search and two thirds of referral
+#      sessions (Jul-Aug 2026).
+#   ⚠️ firstSessionQualifiedSession, firstAppOpeningFirstWebQualifiedSession and
+#      appOpeningFirstWebQualifiedSession are a snapshot from the first-session
+#      property, never restated: for first sessions 2025-01-01 → 2026-10-07 they keep
+#      the definition without the referral / organic-search exclusion. They read true
+#      where the session itself is now false on ~2.6% of a day's first sessions in
+#      2025 and ~0.8% in 2026. For first sessions under the current definition use
+#      qualifiedSession with isFirstSession (sessions).
+# businessModel: partner commission model stamped on the click (clicks only)
+#   values: [cpc, cpa, cpa%, rs, cpa_min_cpc, cpa%_min_cpc, bid, NULL]
+#   cpa_min_cpc / cpa%_min_cpc: since 2026-05-01, revenue-wise they work like
+#     cpa / cpa% (the floor is in minCpc).
+#   bid: MAL external networks (clicktripz, kayak, viajala), since 2026-01-01.
+#   amc3: LM only, discontinued 2024-07-09 in favour of cpa% — history only.
+#   NULL: every click before 2024-06-12 (Core) and before 2026-01-01 (MAL).
+#   ⚠️ There is NO commissionModel column (UNKNOWN_IDENTIFIER). The catalog's
+#      "Commission Model" is the computed coalesce businessModel → ruleBusinessModel
+#      in computed.yml — use it for any window before 2024-06-12.
+#   See ruleBusinessModel under PARTNER/COMMERCIAL for how the two differ.
+# businessView: see macroArea above
+# product: Jetcost product vertical
+#   values: [FLIGHT, CAR, DP]
+#   ⚠️ Uppercase codes. 'Flight'/'DynamicPackage' are metric-name suffixes, NOT column
+#      values — product = 'Flight' or 'DynamicPackage' returns ZERO rows.
+#      DP (dynamic package) was active ONLY between 2023-07-19 and 2025-09-30 —
+#      confirmed, not inferred. 58.5k searches over the whole window. There is no DP
+#      data before or after it, while FLIGHT and CAR run to date.
+#      So: a DP metric reading 0 for any recent period is EXPECTED, never an anomaly —
+#      do not report it as a drop. A DP time series is only meaningful inside that
+#      window, and a period straddling 2025-09-30 mixes active and inactive months.
+#      Geography differs per product — see R016 in query-rules.yml.
+#
+# --- FIRST FLIGHT SEARCH DIMENSIONS --------------------------
+# Attributes of ONE search, carried onto the user. Two scopes:
+#   (no prefix)   → current search (searches/clicks/impressions datamarts)
+#   firstSessionFirstFlightSearch*
+#                 → first flight search of the user's FIRST session, lifetime
+#                   (e.g., firstSessionFirstFlightSearchIataFrom). sessions ONLY.
+#
+# ⚠️ FLIGHT ONLY. The source is raw_jc.flys_search: car and dynamic package
+#    searches never feed these columns, whatever the session's product mix.
+#    A session that only searched cars has them all NULL.
+#
+# ⚠️ The Persona engine dimensions NO LONGER EXIST, in any scope and on any
+#    datamart: persona, macroPersona, travelType, paxType, holidayType,
+#    bookingType, periodType, haulType — neither bare, nor first*, nor
+#    firstSessionFirstFlightSearch*. Never generate a query on them. For haul
+#    type use the distance-based haulTypeDistanceCustom (< 1500 km short-haul,
+#    < 3500 km medium-haul, beyond long-haul), which exists in
+#    searches/clicks/impressions only: sessions has no haul dimension at all.
+#
+# Route and booking window:
+# countryFrom / countryTo: ISO-2 of origin/destination country.
+#   ⚠️ GB CODE SPACE: 'GB', never 'UK'. The session's own `country` uses the
+#      Jetcost convention where GB is written UK. NEVER compare or join the two
+#      without mapping, and never GROUP BY both expecting the same code.
+# iataFrom / iataTo: airport IATA of the searched route
+# iataFromParent / iataToParent: city-level parent (MXP → MIL, CDG → PAR).
+#   NULL when the airport is not in config.dict_airport.
+# bookingWindow: Int32, days between search date and departure date.
+#   Can be NEGATIVE on dirty rows (~0.1%, min -1): filter >= 0 when bucketing.
+#   For the clustered version see bookingWindowClustered in computed.yml.
+#
+# --- SEARCH DATE FLEXIBILITY (flexibleDates) -----------------
+# flexibleDates: Nullable(String), attr 601 in raw_catalog. Positional code of
+#   the date flexibility the user asked for: ONE DIGIT PER DATE BOUNDARY (0-3
+#   days), read as a goDate pair followed by a backDate pair.
+#     RT (isAr = true)  → 4 digits [go-, go+, back-, back+]
+#         '1133' = goDate ±1 and backDate ±3   '0033' = goDate fixed, backDate ±3
+#         '3300' = goDate ±3, backDate fixed   '3333' = ±3 on both
+#     OW (isAr = false) → 2 digits [go-, go+]
+#         '11' = goDate ±1                     '33' = goDate ±3
+#   Digits are 0-3 only, and code length tracks trip type (4 ⇄ RT, 2 ⇄ OW) —
+#   the all-zero codes below are the systematic exception. Populated for
+#   product = 'FLIGHT' only, over the whole datamart history (non-NULL rows
+#   since 2019-01-01, so no availability caveat on any window). Present on
+#   searches, clicks and impressions.
+#   NULL = no flexibility requested, i.e. a standard fixed-date search — the
+#   large majority of flight searches, so expect a small absolute volume on the
+#   flexible side of any split.
+#   ⚠️ NULL is overloaded — it also means "not applicable": every CAR/DP row is
+#      NULL. A flexible-vs-standard split MUST filter product = 'FLIGHT', or NULL
+#      conflates fixed-date flight searches with non-flight ones.
+#   ⚠️ NOT NULL is NOT the same as flexible: all-zero codes ('0000', '00') mean
+#      zero flexibility on every boundary, and are also the only codes whose
+#      length can contradict isAr ('0000' on OW rows, '00' on RT ones). Residual
+#      volume, and absent from history before 2026-05-11.
+#      So never classify on NULL — classify on the digits:
+#        flexible → flexibleDates IS NOT NULL AND match(flexibleDates, '[1-3]')
+#        standard → flexibleDates IS NULL OR NOT match(flexibleDates, '[1-3]')
+#
+# --- CONSENT DIMENSIONS --------------------------------------
+# Seven Nullable(Bool) columns, declared on sessions and inherited by searches,
+# clicks and impressions (absent from users). NOT a 1/0/empty string triple:
+# compare with true/false, never with '1'/'0'/''.
+#   ⚠️ THREE-STATE, and NULL is not a refusal. NULL = no consent state recorded
+#      (question never answered, or never asked). So "refused" is `= false` and is
+#      NOT the complement of `= true`: a share computed as 1 - granted folds the
+#      unrecorded sessions into the refusals. Any consent split must decide
+#      explicitly what to do with NULL.
+#   ⚠️ Populated only since 2024-05-12 — every row before that date is NULL on all
+#      seven, for coverage reasons, not because consent was refused. A consent
+#      series crossing that date reads as a step change that isn't one.
+#
+# GDPR consents, collected via Iubenda (the cookie banner). The four move
+# independently — a user can grant one and refuse another, so don't read any of
+# them as a single "accepted the banner" flag:
+# iubendaTech: technical/necessary consent. The portal can't run without it, so it
+#   is NEVER false (verified over the whole populated history): it discriminates
+#   "consent state recorded" (NOT NULL) from "nothing recorded" (NULL), nothing
+#   more. Set exactly when the other three Iubenda ones are set.
+# iubendaMktg: consent to marketing tracking
+# iubendaDtra: consent to transferring data to third parties
+# iubendaMeas: consent to tracking for measurement purposes
+#
+# Consents collected internally, NOT by Iubenda — the `iubenda` prefix on these
+# three is a naming artefact of the four above, not a statement of origin:
+# iubendaStrk: OS-level tracking permission (iOS App Tracking Transparency and the
+#   Android advertising-ID equivalent). APP ONLY — a few dozen web rows exist over
+#   the whole history and are noise; filter context = 'app' for any strk read.
+# iubendaGloc: geolocation consent, app only — ALWAYS NULL, on every row of every
+#   datamart since 2019. Forward-looking: the consent exists in the model but is
+#   not being asked of users today, so nothing populates it. Never report it as
+#   "consent refused" and never build a filter on it.
+# iubendaWapn: push notification consent, web AND app (browser notification
+#   permission on web, push permission in app — one consent, both contexts), so
+#   this is the only one of the three meaningful on a web/app split.
+#
+# Business meaning of all seven, and what they gate downstream, lives in the
+# business context skill's data/consents.md.
+#
+# --- CLICK-LEVEL SPECIFICS -----------------------------------
+# clickCategory: click type code. 13 values — the authoritative taxonomy is the
+#   ClickHouse dictionary `config.dict_click_category`, which exposes
+#   clickCategoryMacroType / Type / SubType / Description / IsDeprecated. Resolve with
+#   dictGet('config.dict_click_category', 'clickCategoryMacroType', tuple(clickCategory))
+#   rather than hardcoding the codes below.
+#   macroType Core        → 1001 (Regular Clickout Core), 5001
+#   macroType Mal Core    → 3003 (MAL Promobox)
+#   macroType Mal Media   → 2001*, 2002*, 2003 (Checkbox), 3001*, 3002*, 3004, 3005,
+#                           3006 (Inline), 4001*, 4002 (Exit Unit)
+#   (* = clickCategoryIsDeprecated — still present in historical data)
+#   ⚠️ "Core clicks" means macroType 'Core' = clickCategory IN (1001, 5001). Filtering
+#      on 1001 alone silently drops 5001. Route geography (countryFrom/countryTo) is
+#      populated on Core clicks only — see R016 in query-rules.yml.
+# searchTriggerSource: the UI entry point that started the search (searches/clicks)
+#   Observed values, grouped (distinct on jc_searches_datamart, 2026-09):
+#     form:         search_form
+#     re-issued:    inactivity_refresh (web), default (web)
+#     SERP intercards: nearby_dates_intercard, direct_dates_intercard,
+#                   nearby_airports_intercard (app), inspirational_intercard
+#     cards/content: airport_to_everywhere_card (web), airport_to_country_card (web),
+#                   new_deals (web), theme_card (web), last_search_card (app),
+#                   last_search_bell (app), offer_deal (app), content_card (app),
+#                   travel_story_cta (app), bookmark (app)
+#     external entry: travel_meta (web, metasearch landing), shared_link (web,
+#                   sharing link — only since 2026-04-13), dynamic_link (app),
+#                   apn (app push notification), oia (app)
+#     navigators:   price_navigator (web), dates_navigator (web, since 2026-06-15)
+#   '' and NULL are both present, on every platform: the entry point was not
+#   tracked. Neither means search_form — keep them as their own bucket.
+#   Not every value exists on every platform (see tags above): a web-only value
+#   reads 0 on app by construction, never an anomaly.
+#   e.g. "searches from the sharing link" → searchTriggerSource = 'shared_link'.
+# searchTriggerSourcePage: page the entry point sat on
+#   Observed values: home, results, airport_to_airport, airport_to, airport_from,
+#   airport_to_everywhere, airport_to_country, airline, airlines, airports,
+#   country_to, country_from, country_to_country, countries, flights, deals,
+#   bookmarks, last_searches, shared_link, travel_story, themes, cms,
+#   page_not_found, airport_not_found, country_not_found, wpn, default.
+#   NULL whenever searchTriggerSource is ''/NULL, and on app entries with no page
+#   (apn, oia, dynamic_link, content_card, part of Android search_form/bookmark).
+# searchTriggerSourceDetail: optional qualifier of the entry point, NULL on most rows
+#   app: which suggester fed the form — suggester_departure, suggester_arrival,
+#        suggester_last_search, suggester_both
+#   web: ar (round trip), ow (one way), direct — mostly on new_deals.
+#        ar/ow track round trip vs one way (backDate NULL) closely but not
+#        exactly; 'direct' does NOT match isDirect — don't read it as non-stop.
+# Commission model: NOT a column — see businessModel under KEY DIMENSIONS and
+#   the computed "Commission Model" in computed.yml.
+# conversionType: type of partner conversion
+#
+# --- IMPRESSION-LEVEL SPECIFICS (impressions datamart) -------
+# An impression = an ITINERARY DISPLAYED to a user on the SERP.
+# A click = a specific OFFER clicked. One itinerary can have 1+ offers.
+#
+# ⚠️ LOW PRIORITY DATAMART: use impressions ONLY when the user
+#    explicitly asks about displayed itineraries or SERP-level analysis.
+#    For generic questions (revenue, clicks, partner perf) → use clicks.
+#
+# impressionType: type of displayed element
+#   values: [itinerary_core, itinerary_cug, intercard, mal_promobox, minicar]
+# impressionSubType: granular sub-type
+#   values: [itinerary_core, itinerary_cug, intercard_not_found,
+#            intercard_prices_nearby_dates, intercard_inspirational,
+#            intercard_direct_dates, intercard_nearby_airports,
+#            mal_promobox_inline, mal_promobox_sponsored_flight_itinerary,
+#            mal_promobox_click_to_call, mal_promobox_right_column_flight_itinerary,
+#            error, minicar]
+#
+# Hero offer (main offer on the itinerary card):
+#   heroPartnerCode/heroGroupCode, heroUnitaryPrice/heroTotalPrice,
+#   heroDiscountedUnitaryPrice/heroDiscountedTotalPrice, heroDiscount,
+#   heroPaymentMethod/heroPaymentMethodFees*, heroPartnerQualityScore,
+#
+# Other offers (the competitors on the same card, below the hero):
+#   otherOffers — the FULL array of offers (avg 4.6, max 22), one JSON string per
+#     offer, hero excluded. Keys always present: offer_id, offer_type (core|cug),
+#     partner_code, ranking_position (1..N, unique, no holes), unitary_price,
+#     total_price, payment_method, payment_method_fees[{code,fee}].
+#     Optional keys: is_airline, is_self_transfer, baggages_info{checked,cabin,hand},
+#     discount, discounted_unitary_price, discounted_total_price,
+#     is_sponsored, is_vi, is_vi_displayed.
+#     A key can be present with a null value → always extract as Nullable.
+#     Empty array before 2026-07-01 and for every non-itinerary impressionType.
+#
+# Promobox (MAL advertising):
+#   promobox{PartnerId|PartnerName|NetworkId|NetworkName|Price|IataFrom|IataTo}
+#     The network/partner pair of the MAL placement (see `network`/`networkPartner`
+#     on clicks), but ONLY for impressionType = 'mal_promobox' — i.e. MAL Core.
+#     Exit unit, inline and checkbox have no impression rows carrying these, so
+#     impressions cannot answer a MAL Media question. Network names are TitleCase
+#     here (ClickTripz, Mdflow, Kayak, Viajala) vs lower-case on clicks — never
+#     join the two datamarts on the raw name.
+#
+# Clicked offer reference: clickedPartner / clickedGroupCode
+#
+# Metrics: values generated by that group of impressions
+#   impressions, impressionsDetailPage, clicks, clicksCore, clicksMal,
+#   revenue*, conversions, commissionValueCalculated*, amc3
+#
+# --- ROUTE/GEOGRAPHY (searches & clicks) ---------------------
+# iataFrom/iataTo: IATA airport codes
+# iataFromParent/iataToParent: parent IATA (city/metro level)
+# airportFrom/airportTo: airport names
+# countryFrom/countryTo: origin/destination country, ISO 3166-1 alpha-2
+#   ⚠️ The UK is 'GB' on these fields, NOT 'UK' — countryFrom = 'UK' returns ZERO
+#      rows. The market/user fields (country, countryUser) use 'UK' instead, so
+#      never compare the two families on a shared literal. Same for pickupCountry
+#      and dropoffCountry. See R015 in query-rules.yml.
+# continentFrom/continentTo: origin/destination continent
+# haulTypeDistanceCustom: haul class by route distance, FLIGHT only —
+#   short-haul < 1500 km, medium-haul < 3500 km, long-haul beyond.
+#   It is the ONLY haul dimension: haulTypeDistance (the source's own haul_type,
+#   which had a 'domestic' class and often contradicted the distance) and the
+#   Persona haulType no longer exist. For domestic vs international use isDomestic.
+# clusterParentRoute: parent route cluster for aggregation
+# distanceKm: route distance in km
+#
+# --- PARTNER/COMMERCIAL (clicks) -----------------------------
+# partner: partner display name
+# partnerCode: partner internal code
+# partnerBrand: partner brand grouping
+# groupCode: commercial group code
+# groupInvoicing: invoicing entity
+# ruleId/ruleValue/ruleBusinessModel: commercial rule details
+# ruleBusinessModel: business model of the commercial rule the click matched.
+#   Same values as businessModel, minus bid, plus amc3 (history); '' — never
+#   NULL — when no rule matched: all MAL before 2026-01-01 and every MAL
+#   external-network (bid) click.
+#   vs businessModel: same meaning, different coverage. Where both are set they
+#   agree on 99.9% of clicks; ruleBusinessModel goes back to 2019-01-01,
+#   businessModel only to 2024-06-12. For the click's model, read businessModel
+#   and fall back to ruleBusinessModel ("Commission Model" in computed.yml).
+# network: MAL demand network. MAL clicks only (empty on Core). Four live:
+#   mdflow (internal — Jetcost's own direct partner demand), clicktripz, kayak,
+#   viajala. Populated from 2026-01-01 only.
+# networkPartner: the advertiser that actually buys the MAL click and owns the
+#   landing domain. Populated on 100% of MAL clicks from 2026-01-01, all networks
+#   and all placements. This — NOT partnerCode — is the partner dimension for MAL:
+#   groupCode/partnerCode exist only on the mdflow share (~50% of MAL Media,
+#   ~69% of MAL Core), because the external networks are the commercial
+#   counterpart, not the advertiser behind them. Case differs by network
+#   (mdflow UPPER, external lower-case slugs) → lower() before grouping, and the
+#   same buyer can arrive through several networks.
+# integrationType / integrationSubType: how the clicked placement is integrated
+#   (clicks only). One integrationType per clickCategory:
+#     CORE        (1001) → STANDARD, BACKFILL, SPONSORED-DETAIL (since 2026-05-26)
+#     PROMOBOX    (3003, MAL Core) → SPONSORED, INLINE-STATIC-PRICE,
+#                 COMPARE-RIGHT-SHOULDER, CLICK-TO-CALL, RIGHT-COLUMN
+#     TRAILINGTAB (4002, the exit unit) → STANDARD
+#     INLINE      (3006) → STANDARD
+#     CHECKBOX    (2003) → STANDARD — meta-spinner only, since 2026-06-24
+#   EXITUNIT / FORM: 2 clicks in 2026-03, not a live placement.
+#   ⚠️ NULL on EVERY MAL click (clickCategory != 1001) before 2026-01-01 —
+#      the historical shape, not a gap; use clickCategory there. Core clicks
+#      are populated over the whole history (2019-01-01).
+#   ⚠️ CORE / BACKFILL is NOT a direct integration: offer content sourced from
+#      another metasearch (KAYAK, VIAJALA; SKYSCANNER up to 2024-01), so groupCode
+#      names the source, not a negotiated partner.
+#   See core/commercials/integration-types.md in the domain bundle.
+#
+# --- ITINERARY DETAILS (searches & clicks) -------------------
+# outbound/inbound + Airlines/Datetime/DurationMinutes/IataFrom/IataTo/Stops
+# bestPrice/bestPartner: best offer in the search result
+# cheapestTotalPrice/cheapestUnitaryPrice: cheapest displayed price
+# price/totalPrice/unitaryPrice: click-level pricing
+# isVi: Virtual Interlining offer (historical; from 2026-06-25 use isSelfTransfer for new data)
+# isSelfTransfer: itinerary has ≥1 Virtual Interlining (self transfer) offer; replaces isVi/isViDisplayed (attr 1257, web since 2026-06-25)
+# isDirect: direct flight
+# isPinned: pinned/highlighted offer
+#
+# --- RANK DIMENSIONS -----------------------------------------
+# Rank fields are ORDINAL COUNTERS: they express "this is the N-th occurrence
+# of event X within context Y" for the current row.
+# Example: searchRankPerSession = 3 means this is the 3rd search the user
+# performed in the current session.
+#
+# Three context scopes:
+#   *RankPerSearch  → counter resets at each search
+#                     (e.g., clickRankPerSearch = 2 → 2nd click in this search)
+#   *RankPerSession → counter resets at each session
+#                     (e.g., searchRankPerSession = 1 → 1st search of this session)
+#   *RankPerUser    → counter NEVER resets; monotonically increasing across the
+#                     user's entire lifetime
+#                     (e.g., clickRankPerUser = 47 → user's 47th ever click)
+#
+# Two naming prefixes:
+#   (no prefix)    → event-scoped rank: the rank of the CURRENT event
+#                    (e.g., clickRankPerSession = position of this specific click
+#                     within the session)
+#   user*RankPerUser → user-scoped rank: characterises the USER at session time,
+#                      not a specific event
+#                      (e.g., userSearchFlightRankPerUser = how many flight searches
+#                       this user had made BEFORE the current session — useful for
+#                       segmenting "first-time searchers" vs "experienced users")
+#                      ⚠️ They EXCLUDE the current session, and they are a daily
+#                      snapshot: userSessionRankPerUser = sessionRankPerUser - 1 on
+#                      93.7% of rows and equals it on 0 of 4,059,348 (week
+#                      2026-09-13→19); the rest lag further back. With no prior
+#                      history userSessionRankPerUser reads 0, while every
+#                      event-based one (userSearch*, userClick*, userConversion*,
+#                      userRevenue*) reads NULL — on 100% of first sessions, and
+#                      still on 33% (userSearchRankPerUser) to 90%
+#                      (userConversionRankPerUser) of returning ones. That NULL is
+#                      mostly a ZERO IN DISGUISE, not a coverage hole: on 90.5% of
+#                      returning sessions the user IS in the snapshot
+#                      (userSessionRankPerUser >= 1) and the event column is NULL
+#                      anyway, because they have none of that event on record —
+#                      164,311 such rows for searches, 222,183 for clicks, 567,920
+#                      for conversions, a gradient that tracks how rare the event
+#                      is. The other 9.5% are users the snapshot has not caught up
+#                      with at all (userSessionRankPerUser = 0 on a session that is
+#                      not their first); there the whole block is missing, not zero.
+#                      So: read userSessionRankPerUser first to tell the two apart,
+#                      then treat NULL as 0 — but note the inconsistency, because
+#                      userSessionRankPerUser itself stores a real 0 for the same
+#                      "nothing yet" case the others store as NULL.
+#                      A first-ever flight search is therefore
+#                      `userSearchFlightRankPerUser IS NULL AND
+#                      searchFlightRankPerSession = 1` — never `= 1`, which selects
+#                      users who already had exactly one before this session.
+#                      ⚠️ The user* variants are NOT NULL-scoped by family — a
+#                      Core click carries userClickNotCoreRankPerUser normally —
+#                      but they are built from the click-level column, so they
+#                      inherit its per-category counting (trap 2 below): they are
+#                      a lifetime count of ONE clickCategory, not of the whole
+#                      family. On sessions, userClickRankPerUser exceeds
+#                      userClickCoreRankPerUser + userClickNotCoreRankPerUser on
+#                      8.1% of rows (week 2026-09-13→19) — never the reverse.
+#
+# ⚠️ AVAILABILITY — the two prefixes do NOT cover the same datamarts:
+#   user*RankPerUser  → available on ALL five datamarts (sessions, searches,
+#                       clicks, impressions, users)
+#   search*Rank*      → searches and clicks ONLY. The event-scoped search ranks
+#                       are absent from impressions, which carries no search-grain
+#                       rank at all — for the *PerUser ones use the user* form
+#                       instead; the *PerSession ones have NO equivalent there.
+#   This exception is declared as `not_inherited_dimensions` under the impressions
+#   datamart below, so the coverage check knows about it too.
+#
+# Event types covered:
+#   session*    → session occurrences for the user
+#   search*     → all searches (searchRankPerSession/User)
+#   searchFlight* → flight-specific searches
+#   searchCar*    → car-specific searches
+#   searchDp*     → dynamic-package searches
+#   click*      → all clicks
+#   clickCore*  → clicks with clickCategory = 1001 only (NULL on every other click)
+#   clickNotCore* → clicks with clickCategory != 1001, counted PER CATEGORY
+#                   (NULL on Core clicks — see FAMILY-SCOPED COLUMNS below)
+#   conversion* → clicks carrying a booking (NULL on every other click)
+#
+# Cumulative revenue variants (same scoping logic, but SUM not COUNT):
+#   *CumulativePerUser    → total revenue accumulated for this user lifetime
+#   *CumulativePerSession → total revenue accumulated within this session
+#   *CumulativePerSearch  → total revenue accumulated within this search
+#
+# ⚠️ NO USER KEY → THE WHOLE BLOCK GOES NULL AT ONCE. Every event-scoped rank and
+#    cumulative column is gated on `jetuser IS NOT NULL` in the ETL, family or not,
+#    so a row without a user key carries NULL in all of them together. Week
+#    2026-09-13→19: 2.70% of searches (41,574 of 1,541,346 — always PerSession and
+#    PerUser together, no partial case), 0 on clicks and 0 on sessions. A GROUP BY
+#    or countIf over any rank column drops those rows silently.
+#
+# ⚠️ FAMILY-SCOPED COLUMNS — clickCore*/clickNotCore*, revenueCore/NotCore
+#    Cumulative*, conversion*/commissionValueCalculatedCumulative*, at all
+#    three scopes. Two traps, both verified on 2026-09 data and both visible in
+#    the window functions that build them (jetcost-bi, resources/queries/etl2/
+#    modeled_jc_clicks_data.sql, block "Rankings a livello di user - session -
+#    search"). The catalog carries the same definitions: its descriptions for
+#    attributes 1048-1080 were rewritten on 2026-09-22 and now state the NULL
+#    rules and the per-category counting. Note that raw_catalog in ClickHouse is
+#    a daily copy of it, so it keeps serving the old boilerplate until the next
+#    sync. What lives only here is the operational side below — the measured
+#    NULL shares, and what can and cannot be derived from the differences.
+#
+#   1. NULL OUTSIDE THE FAMILY. A Core column is NULL on every non-Core click,
+#      a NotCore column is NULL on every Core click, and conversion*/commission*
+#      are NULL on every click without a booking — 100%, no exception (week
+#      2026-09-13→19: 435,030 non-Core, 282,612 Core, 712,794 non-converting
+#      clicks). So count()/avg() over one of these columns silently drops the
+#      other family, and WHERE clickCoreRankPerSession = 1 excludes every MAL
+#      click instead of selecting the session's first Core click. The all-clicks
+#      columns (clickRank*, revenueCumulative*) never go NULL this way — only
+#      through the user-key gate above.
+#
+#   2. COUNTED PER clickCategory, NOT PER FAMILY. The split is hardcoded on
+#      clickCategory = 1001 / != 1001 — NOT on clickCategoryMacroType, so MAL
+#      Core (3003) counts as NotCore, and 5001 (macro-type Core, never seen
+#      since 2023) would count as NotCore too — and the window partitions by
+#      clickCategory. A NotCore column therefore restarts at 1 for EACH non-Core
+#      category: a session with a MAL Exit Unit (4002) click and a MAL Promobox
+#      (3003) click carries clickNotCoreRankPerSession = 1 on both. It is the
+#      N-th click of THIS click's own category, never the N-th non-Core click
+#      (verified 2026-09-16: exact, 0 exceptions in 68,485 rows; 5.2% of sessions
+#      with non-Core clicks span two categories). Core is immune only because it
+#      is a single category. The revenue*Cumulative* variants inherit the same
+#      partition: a per-category running total, not a per-family one — in the
+#      2,446 sessions holding two non-Core categories, summing the per-category
+#      maxima reproduces revenueCumulativePerSession in 2,446 cases and reading
+#      the two family columns as if they covered the whole family in 0.
+#
+#   SEQUENCING Core vs MAL INSIDE A SESSION. No datamart exposes a usable
+#   session key — the only column carrying session ids is the unverified
+#   diagnostic array userSessionEnhancedHistoryLast90Days — so the rows of one
+#   session cannot be grouped and ordered. The only per-row handle is
+#      clickRankPerSession - <family rank>
+#        = how many clicks of OTHER categories preceded this one in the session.
+#   On a Core click that is exactly "how many MAL clicks came first" (0 breaks in
+#   44,440 Core clicks, 2026-09-16), because Core is one category. On a MAL click
+#   it is NOT "how many Core clicks came first": it also counts the other MAL
+#   categories, and is wrong on 5.5% of MAL clicks (3,756/68,443). The Core
+#   clicks preceding a MAL click cannot be isolated at all.
+#
+#   SEARCH RANKS ARE THE SAFE CASE — trap 1 only. searchFlight/Car/DpRank* have
+#   the identical shape (modeled_jc_searches_data.sql: `if(product = 'FLIGHT',
+#   ROW_NUMBER() OVER (PARTITION BY jetuser, product, jetsess ...), NULL)`), so
+#   they are 100% NULL outside their own product — verified on FLIGHT and CAR —
+#   but trap 2 does NOT apply: here the partition key IS the family, so each
+#   counter is exact and the subtraction is reliable.
+#     searchRankPerSession - searchFlightRankPerSession
+#       = how many non-FLIGHT searches preceded this one in the session
+#   (0 breaks in 220,613 flight and 1,531 car searches, 2026-09-16). Same for
+#   conversionRank*/commission*, gated on hasConversion = 1 with an equally
+#   no-op partition: exact counters, trap 1 only (conversionRankPerSession equals
+#   the click's position among the session's converting clicks on 13,773 of
+#   13,774, 2026-09-01→20).
+#
+# Typical use cases:
+#   - Funnel depth analysis: GROUP BY searchRankPerSession to see how engagement
+#     drops off with successive searches in a session
+#   - User lifecycle segmentation: WHERE userSearchFlightRankPerUser IS NULL AND
+#     searchFlightRankPerSession = 1 to isolate first-ever flight searches — NOT
+#     `= 1`, which excludes every genuine first-timer (see the ⚠️ on the user*
+#     prefix above)
+#   - Session quality: WHERE clickRankPerSearch >= 2 to find multi-click searches
+# ============================================================
+
+
+datamarts:
+  sessions:
+    dimensions:
+      - column_name: qualifiedSession
+      - column_name: country
+      - column_name: region
+      - column_name: language
+      - column_name: businessProfile
+      - column_name: context
+      - column_name: platform
+      # The A/B test the session was exposed to; NULL when it was in none. See the
+      # domain bundle's product concept on A/B tests for what a test is and how its
+      # perimeter (website x country x language x device rules) is defined.
+      # ONLY populated while that test is switched on. Two consequences, and both
+      # look like broken data without being it:
+      #   - days the test was off return ZERO rows for it, which is indistinguishable
+      #     from a failed load if you only look at the slice
+      #   - the days it was switched on or off part-way through are PARTIAL by
+      #     construction and are not comparable with the full days around them
+      # NEVER read a test slice in absolute terms. Run the same query WITHOUT the
+      # abTestId filter and compare the slice's SHARE of that perimeter: a stable
+      # share means the movement is the market's, not the test's. That one extra
+      # query separates a paused test from a real data problem.
+      # The on/off history lives in the operation logs -- source `abtest-logs`,
+      # `entity` = the test code, internal_event_type `enable-abtest` /
+      # `disable-abtest` -- see jc-operation-logs-skill. Check it before reading a
+      # test's series as a trend.
+      - column_name: abTestId
+      - column_name: sessionCampaignCampaignType
+      - column_name: iubendaMeas
+      - column_name: iubendaMktg
+      - column_name: firstSessionYearMonth
+      - column_name: firstSessionWeek
+      - column_name: firstSessionCountry
+      - column_name: firstSessionWebsite
+      - column_name: firstSessionDeviceType
+      - column_name: firstSessionPlatform
+      - column_name: firstSessionAbTestVariationId
+      - column_name: firstSessionAbTestVariationName
+      - column_name: firstSessionSessionCampaignTrafficType
+      - column_name: firstSessionSessionCampaignCampaignType
+      - column_name: firstAppOpeningWebDate
+      - column_name: firstAppOpeningWebWeek
+      - column_name: firstAppOpeningWebAbTestName
+      - column_name: firstAppOpeningWebAbTestVariationId
+      - column_name: appOpeningWebYearWeek
+      - column_name: appOpeningWebQualifiedSession
+      - column_name: appOpeningWebLanguage
+      - column_name: appOpeningWebAbTestVariationId
+      - column_name: appOpeningWebSessionCampaignPaidVsNotPaid
+      - column_name: appOpeningOsVersion
+      - column_name: firstSessionQuarter
+      - column_name: appOpeningWebYearQuarter
+      - column_name: appOpeningWebSessionCampaignIsOia
+      - column_name: sessionRankPerUser      # N-th session for this user (lifetime counter, resets never)
+      - column_name: userRevenueNotCoreCumulativePerUser  # cumulative revenue of ONE non-Core clickCategory for this user up to this session — not of all their non-Core clicks (see FAMILY-SCOPED COLUMNS)
+      - column_name: userSearchFlightRankPerUser  # how many flight searches this user has made in their lifetime (up to this session)
+      - column_name: appOpeningFirstWebYearMonth
+      - column_name: appOpeningFirstWebMacroArea
+      - column_name: appOpeningFirstWebWebsite
+      - column_name: appOpeningFirstWebDevice
+      - column_name: appOpeningFirstWebDeviceType
+      - column_name: appOpeningFirstWebPlatform
+      - column_name: appOpeningFirstWebAbTestId
+      - column_name: appOpeningFirstWebAbTestVariationId
+      - column_name: appOpeningFirstWebAbTestVariationName
+      - column_name: appOpeningFirstWebSessionCampaignSource
+      - column_name: appOpeningFirstWebSessionCampaignChannelGroup
+      - column_name: firstAppOpeningFirstWebYear
+      - column_name: firstAppOpeningFirstWebWeek
+      - column_name: firstAppOpeningFirstWebCountry
+      - column_name: firstAppOpeningFirstWebMacroArea
+      - column_name: firstAppOpeningFirstWebCountryUser
+      - column_name: firstAppOpeningFirstWebContext
+      - column_name: firstAppOpeningFirstWebDeviceType
+      - column_name: firstAppOpeningFirstWebAbTestVariationName
+      - column_name: firstAppOpeningFirstWebSessionCampaignCampaignType
+      - column_name: firstAppOpeningFirstWebYearQuarter
+      - column_name: appOpeningFirstWebQuarter
+      - column_name: userBasedFirstWeek
+      - column_name: userBasedFirstYearWeek
+      - column_name: userBasedCampaignCampaignType
+      - column_name: userBasedCampaignPaidVsNotPaid
+      - column_name: userBasedCampaignSource
+      - column_name: userBasedCampaignTrafficType
+      - column_name: sessionContentPaidVsNotPaid
+      - column_name: sessionContentMedium
+      - column_name: sessionContentTrafficType
+      - column_name: sessionContentIsOia
+      - column_name: firstSessionSessionContentCampaignType
+      - column_name: firstSessionSessionContentChannelGroup
+      - column_name: firstAppOpeningWebSessionContentCampaignType
+      - column_name: firstAppOpeningWebSessionContentChannelGroup
+      - column_name: firstAppOpeningFirstWebSessionContentTrafficType
+      - column_name: appOpeningWebSessionContentIsOia
+      - column_name: appOpeningWebSessionContentTrafficType
+      - column_name: appOpeningWebSessionContentMedium
+      - column_name: appOpeningWebSessionContentPaidVsNotPaid
+      - column_name: appOpeningFirstWebSessionContentChannelGroup
+      - column_name: sessionCampaignLocalVsExt
+      - column_name: firstAppOpeningFirstWebSessionCampaignLocalVsExt
+      - column_name: firstSessionSessionContentLocalVsExt
+      - column_name: firstAppOpeningWebSessionContentLocalVsExt
+      - column_name: appOpeningWebSessionContentLocalVsExt
+      - column_name: firstAppOpeningFirstWebSessionContentCountryDetail
+      - column_name: firstAppOpeningFirstWebSessionCampaignCountryDetail
+      - column_name: firstAppOpeningWebSessionCampaignCountryDetail
+      - column_name: firstSessionSessionCampaignCountryDetail
+      - column_name: firstAppOpeningWebSessionContentProduct
+      - column_name: firstSessionSessionContentProduct
+      - column_name: appOpeningWebSessionCampaignProduct
+      - column_name: sessionCampaignProduct
+      # APP-ONLY (null on platform = 'web'). Four values, and each one tells you
+      # which of the sibling appOpeningWeb* columns are actually populated:
+      #   'Consented'      -> Website, SessionCampaign and SessionCampaignPaidVsNot-
+      #                       Paid all set: the opening is fully attributable
+      #   'Unconsented'    -> Website set, but EVERY SessionCampaign* field empty,
+      #                       PaidVsNotPaid included. The web origin is known, its
+      #                       attribution is not — which is exactly why such a
+      #                       session cannot be told paid from notpaid and ends up
+      #                       in userBasedCluster '99. Unconsented' (see below)
+      #   'Unidentified'   -> neither web ids nor muk arrived, only a w2a code (the
+      #                       web tool that sent the user to the app): the web
+      #                       origin is known and nothing else is. EVERY appOpeningWeb*
+      #                       field is empty, as for 'webOriginFalse' — only
+      #                       appOpeningWebOrigin (true) tells the two apart. Ends
+      #                       up in userBasedCluster '99. Unconsented' too
+      #   'webOriginFalse' -> Website empty too: the opening has no web origin at
+      #                       all, i.e. it is not a web-to-app one
+      # The split is clean (100% / 0%, no partial cases) and holds identically for
+      # the firstAppOpeningWeb* family.
+      # 'Unidentified' exists from 2026-09-02 (app 4.48.0+, Android install
+      # referrer). Before that date the same installs arrived with no w2a code and
+      # are indistinguishable from ordinary app openings, so a W2A series crossing
+      # 2026-09-02 gains visibility, not volume. The few openings before 2026-09
+      # with a w2a code but no web ids were not reprocessed and stay 'webOriginFalse'.
+      - column_name: appOpeningWebOriginType
+      - column_name: firstAppOpeningIsDeferred
+      - column_name: lastClickNotDirectCampaignPaidVsNotPaid
+      - column_name: lastClickNotDirectCampaignSource
+      - column_name: lastClickNotDirectCampaignIsOia
+      - column_name: firstAppOpeningWebSessionCampaignSource
+      - column_name: firstAppOpeningFirstWebSessionCampaignSource
+      - column_name: firstAppOpeningFirstWebSessionContentSource
+      - column_name: appOpeningWebSessionCampaignSource
+      - column_name: appOpeningWebSessionContentSource
+      - column_name: appOpeningFirstWebSessionContentSource
+      - column_name: firstSessionSessionCampaignMedium
+      - column_name: countryUser
+      - column_name: website
+      - column_name: abTestVariationId
+      - column_name: abTestVariationName
+      - column_name: sessionCampaignTrafficType
+      - column_name: iubendaStrk
+      - column_name: firstSessionDate
+      - column_name: firstSessionMonth
+      - column_name: firstSessionQualifiedSession
+      - column_name: firstSessionWebsiteType
+      - column_name: firstSessionSessionCampaignPaidVsNotPaid
+      - column_name: firstSessionSessionCampaignSource
+      - column_name: firstSessionSessionCampaignChannelGroup
+      - column_name: firstAppOpeningWebYear
+      - column_name: firstAppOpeningWebYearMonth
+      - column_name: firstAppOpeningWebQualifiedSession
+      - column_name: firstAppOpeningWebMacroArea
+      - column_name: firstAppOpeningWebRegion
+      - column_name: firstAppOpeningWebAbTestId
+      - column_name: firstAppOpeningWebSessionCampaignPaidVsNotPaid
+      - column_name: firstAppOpeningWebSessionCampaignCampaignType
+      # Name of the dynamic link the app was opened with. A feature configuration
+      # value: it changes over time, is not classified by the campaign registry,
+      # and is empty on a large share of web-to-app openings. Never use it to tell
+      # which W2A tool produced a session — read the sessionContent* hierarchy
+      # (ChannelGroup → TrafficType → CampaignType) instead.
+      - column_name: firstAppOpeningDynLinkName
+      - column_name: firstAppOpeningWebOrigin
+      - column_name: appOpeningWebDate
+      - column_name: appOpeningWebMonth
+      - column_name: appOpeningWebYearMonth
+      - column_name: appOpeningWebCountryUser
+      - column_name: appOpeningWebDevice
+      - column_name: appOpeningWebAbTestVariationName
+      # Name of the dynamic link the app was opened with. A feature configuration
+      # value: it changes over time, is not classified by the campaign registry,
+      # and is empty on a large share of web-to-app openings. Never use it to tell
+      # which W2A tool produced a session — read the sessionContent* hierarchy
+      # (ChannelGroup → TrafficType → CampaignType) instead.
+      - column_name: appOpeningDynLinkName
+      - column_name: appOpeningWebQuarter
+      - column_name: firstAppOpeningWebYearQuarter
+      - column_name: firstAppOpeningWebSessionCampaignIsOia
+      - column_name: year
+      - column_name: quarter
+      - column_name: yearQuarter
+      - column_name: appOpeningFirstWebYearWeek
+      - column_name: appOpeningFirstWebLanguage
+      - column_name: appOpeningFirstWebContext
+      - column_name: appOpeningFirstWebSessionCampaign
+      - column_name: appOpeningFirstWebSessionCampaignTrafficType
+      - column_name: appOpeningFirstWebSessionCampaignCampaignType
+      - column_name: firstAppOpeningFirstWebQualifiedSession
+      - column_name: firstAppOpeningFirstWebRegion
+      - column_name: firstAppOpeningFirstWebLanguage
+      - column_name: firstAppOpeningFirstWebWebsiteType
+      - column_name: firstAppOpeningFirstWebDevice
+      - column_name: firstAppOpeningFirstWebPlatform
+      - column_name: firstAppOpeningFirstWebSessionCampaign
+      - column_name: firstAppOpeningFirstWebSessionCampaignMedium
+      - column_name: firstAppOpeningFirstWebSessionCampaignIsOia
+      - column_name: userBasedFirstYear
+      - column_name: userBasedFirstYearQuarter
+      - column_name: userBasedCampaignChannelGroup
+      - column_name: sessionContentSource
+      - column_name: sessionContentChannelGroup
+      - column_name: firstSessionSessionContentIsOia
+      - column_name: firstSessionSessionContentTrafficType
+      - column_name: firstSessionSessionContentPaidVsNotPaid
+      - column_name: firstAppOpeningWebSessionContentIsOia
+      - column_name: firstAppOpeningWebSessionContentTrafficType
+      - column_name: firstAppOpeningWebSessionContentPaidVsNotPaid
+      - column_name: firstAppOpeningFirstWebSessionContentIsOia
+      - column_name: firstAppOpeningFirstWebSessionContentCampaignType
+      - column_name: firstAppOpeningFirstWebSessionContentPaidVsNotPaid
+      - column_name: appOpeningWebSessionContentCampaignType
+      - column_name: appOpeningWebSessionContentChannelGroup
+      - column_name: appOpeningFirstWebSessionContentCampaignType
+      - column_name: appOpeningFirstWebSessionContentPaidVsNotPaid
+      - column_name: firstAppOpeningWebSessionCampaignLocalVsExt
+      - column_name: appOpeningWebSessionCampaignLocalVsExt
+      - column_name: sessionContentLocalVsExt
+      - column_name: firstAppOpeningFirstWebSessionContentLocalVsExt
+      - column_name: weekDayNumber
+      - column_name: weekDay
+      - column_name: appOpeningFirstWebSessionCampaignCountryDetail
+      - column_name: sessionCampaignCountryDetail
+      - column_name: appOpeningFirstWebSessionContentProduct
+      # Same four values and the same populated/empty pattern as
+      # appOpeningWebOriginType above, but describing the user's FIRST app opening
+      # rather than the current one; unlike it, this column is also nullable.
+      # 'Unconsented' or 'Unidentified' here routes EVERY app session of that user
+      # to userBasedCluster '99. Unconsented' — Consented or paid sessions included —
+      # unless appOpeningWebOriginType is itself one of the two, which wins in
+      # userBasedClusterDebug. See userBasedCluster below.
+      - column_name: firstAppOpeningWebOriginType
+      - column_name: referralDomain
+      - column_name: ipProxySession
+      - column_name: firstSessionIpProxySession
+      - column_name: appOpeningFirstWebIpProxySession
+      - column_name: ipHostingSession
+      - column_name: firstAppOpeningWebIpHostingSession
+      - column_name: appOpeningWebIpHostingSession
+      - column_name: lastClickNotDirectCampaignMedium
+      - column_name: lastClickNotDirectCampaignLocalVsExt
+      - column_name: firstSessionSessionContentSource
+      - column_name: firstSessionSessionContentMedium
+      - column_name: appOpeningFirstWebSessionCampaignMedium
+      - column_name: appOpeningFirstWebSessionContentMedium
+      - column_name: date
+      - column_name: macroArea
+      - column_name: businessView
+      - column_name: device
+      - column_name: deviceType
+      - column_name: abTestName
+      - column_name: sessionCampaign
+      - column_name: sessionCampaignMedium
+      - column_name: iubendaTech
+      - column_name: iubendaDtra
+      - column_name: iubendaWapn
+      - column_name: iubendaGloc
+      - column_name: isFirstSession
+      - column_name: firstSessionYear
+      - column_name: firstSessionMacroArea
+      - column_name: firstSessionRegion
+      - column_name: firstSessionAbTestName
+      - column_name: firstAppOpeningWebCountry
+      - column_name: firstAppOpeningWebBusinessView
+      - column_name: firstAppOpeningWebCountryUser
+      - column_name: firstAppOpeningWebWebsite
+      - column_name: firstAppOpeningWebWebsiteType
+      - column_name: firstAppOpeningWebContext
+      - column_name: firstAppOpeningWebDeviceType
+      - column_name: firstAppOpeningWebPlatform
+      - column_name: firstAppOpeningWebSessionCampaign
+      - column_name: firstAppOpeningOsVersion
+      - column_name: appOpeningWebWeek
+      - column_name: appOpeningWebRegion
+      - column_name: appOpeningWebWebsite
+      - column_name: appOpeningWebWebsiteType
+      - column_name: appOpeningWebPlatform
+      - column_name: appOpeningWebAbTestId
+      - column_name: appOpeningWebSessionCampaign
+      - column_name: appOpeningWebSessionCampaignMedium
+      - column_name: appOpeningVersion
+      # Coarse landing behaviour of the dynamic link (e.g. home vs trigger). It
+      # mixes different W2A tools, so it is not a tool split either — use the
+      # sessionContent* hierarchy instead.
+      - column_name: appOpeningDynLinkBehaviour
+      # Nullable(Date). Date of that user's FIRST web-to-app opening, NULL while it
+      # has not happened yet as of the session START — including on the session that
+      # produced that very opening, which is always NULL here. Date counterpart of
+      # userHasFromWebAppOpening — same source, same consent-only perimeter, same
+      # presence on all four tables; NULL therefore also covers users whose W2A
+      # openings were unconsented or unidentified.
+      - column_name: firstFromWebAppOpeningDate
+      - column_name: firstSessionYearQuarter
+      - column_name: sessionCampaignIsOia
+      - column_name: userCommissionValueCalculatedCumulativePerUser  # cumulative calculated commission for this user (lifetime)
+      - column_name: userConversionRankPerUser    # N-th conversion (booking) for this user (lifetime counter)
+      - column_name: userRevenueCoreCumulativePerUser  # cumulative core revenue for this user (lifetime)
+      - column_name: userClickNotCoreRankPerUser  # lifetime clicks of ONE non-Core clickCategory for this user — NOT their total non-Core clicks (see FAMILY-SCOPED COLUMNS)
+      - column_name: userClickCoreRankPerUser     # lifetime Core (clickCategory 1001) clicks for this user
+      - column_name: userClickRankPerUser         # N-th click (any type) for this user (lifetime counter)
+      - column_name: userSearchCarRankPerUser     # N-th car search for this user (lifetime counter)
+      - column_name: userSearchDpRankPerUser      # N-th dynamic-package search for this user (lifetime counter)
+      # userBasedCluster is a SIX-value enum:
+      #   '01. New Paid' | '02. Returning Paid' | '03. Marketing-Driven'
+      #   '04. New Notpaid' | '05. Returning Notpaid' | '99. Unconsented'
+      #
+      # userBasedClusterDebug carries one of 13 numbered branches (+96-99 for
+      # Unconsented and Unidentified, below) that explain which rule produced the
+      # cluster. Verified against datamart.jc_sessions_datamart_view, last 7 days
+      # (2026-08-26). The 96-99 branches are checked first; then two top-level
+      # cases:
+      #
+      # CASE A — the CURRENT session is itself a W2A (web-to-app) session, i.e.
+      # this app opening came from a web-to-app crossover with its web ids
+      # (appOpeningWebOriginType = 'Consented'). The cluster reads
+      # the underlying WEB session's data (this file's `appOpeningWeb*` /
+      # `firstSessionSessionCampaign*` prefix family above), not the app
+      # session's own:
+      #   01. W2A - New Paid          -> that web session is the user's first,
+      #                                   and paid
+      #   02. W2A - New Notpaid       -> that web session is the user's first,
+      #                                   and not paid
+      #   03. W2A - Returning Paid    -> not the user's first web session,
+      #                                   current one paid
+      #   04. W2A - Marketing-Driven  -> not first, current web session not
+      #                                   paid, but the user's actual first
+      #                                   session (firstSessionSessionCampaign*)
+      #                                   was paid
+      #   05. W2A - Returning Notpaid -> not first, current web session not
+      #                                   paid, first session not paid either
+      #
+      # CASE B — the current session is NOT W2A (plain web, or native app not
+      # tied to a fresh install):
+      #   06. !W2A - New Paid          -> isFirstSession, sessionCampaign paid
+      #   07. !W2A - New Notpaid       -> isFirstSession, sessionCampaign not
+      #                                    paid
+      #   08. !W2A - Returning Paid    -> not first, sessionCampaign paid
+      #   returning + current not paid splits further on whether the user's
+      #   OWN first-ever session was itself a W2A install:
+      #   12. !W2A - Marketing-Driven  -> first session not W2A, and
+      #                                    firstSessionSessionCampaign was paid
+      #   13. !W2A - Returning Notpaid -> first session not W2A, and
+      #                                    firstSessionSessionCampaign not paid
+      #   ...or, if the user's first-ever session WAS a W2A install (a Consented
+      #   one: an Unconsented or Unidentified first install has already sent
+      #   every session of the user to 99), the model
+      #   chases the install chain up to 2 levels back before giving up,
+      #   looking at the `firstAppOpeningWeb*` / `firstAppOpeningFirstWeb*`
+      #   prefix family (the web session(s) behind that first-ever install):
+      #   09. !W2A - W2A Install via paid       -> the web session that drove
+      #                                             the first-ever install was
+      #                                             paid
+      #   10. !W2A - W2A Install via first paid -> that web session wasn't
+      #                                             paid, but ITS OWN first
+      #                                             session was
+      #   11. !W2A - W2A Install via not paid   -> neither was paid ->
+      #                                             Returning Notpaid
+      # Each branch also fixes which session's campaign/date populate
+      # `userBasedCampaign*`/`userBasedFirst*`: the session actually credited
+      # by that branch (current session for 01/02/06/07/08, first session for
+      # 03/04/05/12/13, and the relevant web session in the install chain for
+      # 09/10/11).
+      #
+      # '99. Unconsented' is APP-ONLY (exactly zero rows on platform = 'web'). A
+      # session lands here when its web-to-app origin type is 'Unconsented' (consent
+      # denied, only the muk arrived) or, from 2026-09-02, 'Unidentified' (only a
+      # w2a code arrived): the web origin is known, the W2A chain cannot be
+      # resolved, and neither paid/notpaid nor new/returning can be assigned. The
+      # label says Unconsented, but read the bucket as "W2A not resolvable".
+      # userBasedCampaign* and userBasedFirst* are NULL here. Its
+      # userBasedClusterDebug is one of exactly four values, in precedence order,
+      # which say which origin-type column triggered it:
+      #   '99. Unconsented - appOpeningWebOriginType'       -> appOpeningWebOriginType
+      #                                                        = 'Unconsented'
+      #   '97. Unidentified - appOpeningWebOriginType'      -> appOpeningWebOriginType
+      #                                                        = 'Unidentified'
+      #   '98. Unconsented - firstAppOpeningWebOriginType'  -> only the first-opening
+      #                                                        one is 'Unconsented'
+      #   '96. Unidentified - firstAppOpeningWebOriginType' -> only the first-opening
+      #                                                        one is 'Unidentified'
+      # The two first-opening values catch EVERY app session of that user, Consented
+      # or paid ones included, so the bucket grows with the user base behind it.
+      # It first appears 2025-07 (0.06% of app sessions), ramps through 2025-08
+      # (0.64%), and is stable from 2025-09 at ~3.9-4.9%. Last 30d to 2026-08-23:
+      # 4.2% of app sessions and 4.6% of app revenueCurrentProRataTotal (0.2% and
+      # 1.3% of the all-platform totals). 'Unidentified' adds roughly 0.8 points of
+      # app sessions from 2026-09 (estimated on 2026-09-01..23), so a series of this
+      # bucket crossing 2026-09-02 steps up. Its costProRataMktg is not 0: app-install
+      # campaigns carry cost on app sessions (GAds from 2026-09-07, Apple Ads from
+      # 2026-10-26), OIA campaigns from the October 2026 restatement (see the
+      # marketing pro-rata block below), and 99 absorbs the unresolvable ones (13.6%
+      # of OIA app sessions, 2026-09-07..10-04).
+      # 03-05 are no longer exactly 0 either: a handful of OIA app sessions (~130 in
+      # the same four weeks) fall into them.
+      # ⚠️ Any breakdown by userBasedCluster MUST include this value or state
+      # explicitly that it is excluded. The ROAS Pro Rata / roasProRata families in
+      # computed.yml cover all six and are exhaustive; a hand-written breakdown, and
+      # any breakdown on searches / clicks / impressions, still has to remember it.
+      # Present on sessions, searches, clicks and impressions. searches and clicks
+      # additionally carry a residual '' (empty) bucket of a few dozen rows/day.
+      - column_name: userBasedCluster
+      - column_name: appOpeningWebIsFirstSession
+      - column_name: appOpeningFirstWebYear
+      - column_name: appOpeningFirstWebMonth
+      - column_name: appOpeningFirstWebWeek
+      - column_name: appOpeningFirstWebQualifiedSession
+      - column_name: appOpeningFirstWebRegion
+      - column_name: appOpeningFirstWebCountryUser
+      - column_name: appOpeningFirstWebAbTestName
+      - column_name: firstAppOpeningWebIsFirstSession
+      - column_name: firstAppOpeningFirstWebDate
+      - column_name: firstAppOpeningFirstWebYearMonth
+      - column_name: firstAppOpeningFirstWebYearWeek
+      - column_name: firstAppOpeningFirstWebBusinessView
+      - column_name: firstAppOpeningFirstWebWebsite
+      - column_name: firstAppOpeningFirstWebAbTestId
+      - column_name: firstAppOpeningFirstWebAbTestName
+      - column_name: firstAppOpeningFirstWebAbTestVariationId
+      - column_name: firstAppOpeningFirstWebSessionCampaignChannelGroup
+      - column_name: firstAppOpeningFirstWebSessionCampaignTrafficType
+      - column_name: userBasedCampaign
+      - column_name: userBasedFirstQuarter
+      - column_name: userBasedFirstYearMonth
+      - column_name: sessionContent
+      - column_name: firstSessionSessionContent
+      - column_name: firstAppOpeningFirstWebSessionContentChannelGroup
+      - column_name: firstAppOpeningFirstWebSessionContent
+      - column_name: appOpeningWebSessionContent
+      - column_name: appOpeningFirstWebSessionCampaignLocalVsExt
+      - column_name: userBasedCampaignLocalVsExt
+      - column_name: appOpeningFirstWebSessionContentLocalVsExt
+      - column_name: appOpeningWebSessionContentCountryDetail
+      - column_name: firstAppOpeningWebSessionContentCountryDetail
+      - column_name: firstSessionSessionContentCountryDetail
+      - column_name: sessionContentCountryDetail
+      - column_name: userBasedCampaignCountryDetail
+      - column_name: appOpeningWebSessionCampaignCountryDetail
+      - column_name: appOpeningWebSessionContentProduct
+      - column_name: sessionContentProduct
+      - column_name: userBasedCampaignProduct
+      - column_name: appOpeningFirstWebSessionCampaignProduct
+      - column_name: firstAppOpeningWebSessionCampaignProduct
+      - column_name: firstSessionSessionCampaignProduct
+      - column_name: appOpeningWebReferralDomain
+      - column_name: firstAppOpeningWebIpProxySession
+      - column_name: firstSessionIpHostingSession
+      - column_name: lastClickNotDirectCampaignCampaignType
+      - column_name: sessionCampaignSource
+      - column_name: firstAppOpeningWebSessionContentMedium
+      - column_name: firstAppOpeningFirstWebSessionContentMedium
+      - column_name: userBasedCampaignMedium
+      - column_name: websiteType
+      - column_name: sessionCampaignPaidVsNotPaid
+      - column_name: sessionCampaignChannelGroup
+      - column_name: firstSessionYearWeek
+      - column_name: firstSessionBusinessView
+      - column_name: firstSessionCountryUser
+      - column_name: firstSessionLanguage
+      - column_name: firstSessionContext
+      - column_name: firstSessionDevice
+      - column_name: firstSessionAbTestId
+      - column_name: firstSessionSessionCampaign
+      # --- route and booking window of the user's first flight search --------
+      # User-level, from etl2.user_property_jc_first_session_data, which carries
+      # them for every first session since 2019-01-01. NULL when the user's first
+      # session had no flight search — 37% of first sessions had one in 2021,
+      # 9.6% in 2026.
+      # ⚠️ SESSIONS FLOOR: 2025-01-01. On this datamart they are valued only on
+      #    sessions dated on or after it, and NULL on every session dated before —
+      #    0 sessions with a route in 2019-2024 — even for users whose first search
+      #    is known: sessions were last re-run from 2025-01-01 (Oct 2026). So NULL
+      #    means "no flight search" only from the floor on, and a time series
+      #    across it jumps from 0: that is the re-run, not a trend. The floor moves
+      #    only with a re-run (ClickUp 1244errpp3t, RE-RUN 2027, may take it back
+      #    to 2019-02); check it with "SELECT min(date) FROM
+      #    datamart.jc_sessions_datamart_view WHERE
+      #    firstSessionFirstFlightSearchIataFrom IS NOT NULL". The date is repeated
+      #    below and in computed.yml, on
+      #    firstSessionFirstFlightSearchBookingWindowClustered: move all together.
+      # ⚠️ COHORT METRICS: FLOOR THE COHORT, NOT THE DATES. In ARPU, retention or
+      #    any metric that sets a cohort's later sessions against its first
+      #    sessions, filtering or breaking down by one of these columns (or by
+      #    firstSessionFirstFlightSearchBookingWindowClustered) REQUIRES
+      #    firstSessionDate >= '2025-01-01'. Without it, a user whose first session
+      #    predates the floor has a NULL first session — out of the denominator —
+      #    and valued sessions from 2025 on — in the numerator: revenue without an
+      #    install. A date filter does not help, because no session is dated
+      #    before its firstSessionDate: the leak is which cohorts enter, not which
+      #    days. Measured 2026-10-12 on
+      #    CountryFrom = 'FR', cohorts from 2024-10-12: ARPU inflated +0.6% at D15,
+      #    +1.4% D30, +4.4% D90, +8.3% M6 — the longer the window, the more
+      #    pre-floor cohorts reach past the floor. The ARPU dashboard in
+      #    meta-funnel-dashboard (dashboards/arpu/query.js, FIRST_SEARCH_FROM)
+      #    applies exactly this.
+      # ⚠️ countryFrom/countryTo are in GB code space ('GB', never 'UK'), unlike
+      #    the session's own `country`. See the glossary.
+      - column_name: firstSessionFirstFlightSearchCountryFrom
+      - column_name: firstSessionFirstFlightSearchCountryTo
+      - column_name: firstSessionFirstFlightSearchIataFrom
+      - column_name: firstSessionFirstFlightSearchIataTo
+      - column_name: firstSessionFirstFlightSearchIataFromParent
+      - column_name: firstSessionFirstFlightSearchIataToParent
+      - column_name: firstSessionFirstFlightSearchBookingWindow  # Int32, can be negative on dirty rows
+      - column_name: firstAppOpeningWebMonth
+      - column_name: firstAppOpeningWebYearWeek
+      - column_name: firstAppOpeningWebLanguage
+      - column_name: firstAppOpeningWebDevice
+      - column_name: firstAppOpeningWebAbTestVariationName
+      - column_name: firstAppOpeningWebSessionCampaignMedium
+      - column_name: firstAppOpeningWebSessionCampaignChannelGroup
+      - column_name: firstAppOpeningWebSessionCampaignTrafficType
+      - column_name: firstAppOpeningVersion
+      # Coarse landing behaviour of the dynamic link (e.g. home vs trigger). It
+      # mixes different W2A tools, so it is not a tool split either — use the
+      # sessionContent* hierarchy instead.
+      - column_name: firstAppOpeningDynLinkBehaviour
+      - column_name: isFirstAppOpening
+      - column_name: appOpeningWebYear
+      - column_name: appOpeningWebCountry
+      - column_name: appOpeningWebMacroArea
+      - column_name: appOpeningWebBusinessView
+      - column_name: appOpeningWebContext
+      - column_name: appOpeningWebDeviceType
+      - column_name: appOpeningWebAbTestName
+      - column_name: appOpeningWebSessionCampaignChannelGroup
+      - column_name: appOpeningWebSessionCampaignTrafficType
+      - column_name: appOpeningWebSessionCampaignCampaignType
+      - column_name: appOpeningWebOrigin
+      # Bool. True when the user's FIRST web-to-app opening happened BEFORE this
+      # session started — the build compares the session START datetime with the
+      # opening datetime. THE SESSION THAT PRODUCED THE OPENING IS THEREFORE ALWAYS
+      # FALSE: it starts before the opening it generates (min 1s, median ~2min).
+      # Read it as "came back after having gone to the app", never as "goes to the
+      # app in this session". Checked Aug 2026: of 27,834 sessions that generated an
+      # opening, the 18,157 behind a user's first one are false and the 9,677 behind
+      # a later one are true; no session after the first opening is false and none
+      # before it is true. User-level flag built from that user's FIRST such opening
+      # (etl2.user_property_jc_first_web_app_opening_data), keyed on the
+      # WEB user id webJetUser. Same consent-only perimeter as the fromWeb*AppOpenings
+      # metrics: the source keeps only webJetUser IS NOT NULL rows, which in practice
+      # means webOriginType = 'Consented' (1,876 rows lifetime outside it, all <=
+      # 2025). So it is never true for a user whose W2A went through the unconsented
+      # muk path or arrived as 'Unidentified' (w2a code only, no web user id).
+      # Unlike the metrics, it is present on sessions, searches, clicks AND
+      # impressions, propagated with argMin(..., id) — identical value on all four.
+      - column_name: userHasFromWebAppOpening
+      - column_name: firstAppOpeningWebQuarter
+      - column_name: firstSessionSessionCampaignIsOia
+      - column_name: month
+      - column_name: yearMonth
+      - column_name: week
+      - column_name: yearWeek
+      - column_name: userRevenueCumulativePerUser   # cumulative total revenue for this user up to this search (lifetime)
+      - column_name: userSessionRankPerUser          # N-th session for this user (lifetime counter; characterises user at search time)
+      - column_name: userSearchRankPerUser           # N-th search (any product) for this user (lifetime counter)
+      - column_name: pagesName
+      - column_name: appOpeningFirstWebDate
+      - column_name: appOpeningFirstWebCountry
+      - column_name: appOpeningFirstWebBusinessView
+      - column_name: appOpeningFirstWebWebsiteType
+      - column_name: appOpeningFirstWebSessionCampaignPaidVsNotPaid
+      - column_name: firstAppOpeningFirstWebMonth
+      - column_name: firstAppOpeningFirstWebSessionCampaignPaidVsNotPaid
+      - column_name: firstAppOpeningFirstWebQuarter
+      - column_name: appOpeningFirstWebYearQuarter
+      - column_name: appOpeningFirstWebSessionCampaignIsOia
+      - column_name: userBasedFirstDate
+      - column_name: userBasedFirstMonth
+      - column_name: userBasedCampaignIsOia
+      - column_name: sessionContentCampaignType
+      - column_name: firstAppOpeningWebSessionContentSource
+      - column_name: firstAppOpeningWebSessionContent
+      - column_name: appOpeningFirstWebSessionContentIsOia
+      - column_name: appOpeningFirstWebSessionContentTrafficType
+      - column_name: appOpeningFirstWebSessionContent
+      - column_name: firstSessionSessionCampaignLocalVsExt
+      - column_name: appOpeningFirstWebSessionContentCountryDetail
+      - column_name: firstAppOpeningFirstWebSessionContentProduct
+      - column_name: firstAppOpeningFirstWebSessionCampaignProduct
+      - column_name: firstSessionReferralDomain
+      - column_name: firstAppOpeningWebReferralDomain
+      - column_name: appOpeningFirstWebReferralDomain
+      - column_name: firstAppOpeningFirstWebReferralDomain
+      - column_name: appOpeningWebIpProxySession
+      - column_name: firstAppOpeningFirstWebIpProxySession
+      - column_name: appOpeningFirstWebIpHostingSession
+      - column_name: firstAppOpeningFirstWebIpHostingSession
+      - column_name: appOpeningIsDeferred
+      - column_name: lastClickNotDirectCampaign
+      - column_name: lastClickNotDirectCampaignChannelGroup
+      - column_name: lastClickNotDirectCampaignTrafficType
+      - column_name: lastClickNotDirectCampaignCountryDetail
+      - column_name: lastClickNotDirectCampaignProduct
+      - column_name: trafficControlMap   # Map(String,Tuple(Int8 inControl, String scope, UInt8 pct)) — attr 1254, since 2026-06-09. Key = TC code; access pattern in computed.yml (Traffic Control comment). Scoped variants declared below.
+
+      # --- Scoped variants of businessProfile and trafficControlMap ---
+      # Same semantics as the unprefixed columns above, resolved at the scope
+      # named by the prefix (see TEMPORAL/CROSS-DEVICE PREFIXES in the glossary).
+      - column_name: firstSessionBusinessProfile
+      - column_name: appOpeningWebBusinessProfile
+      - column_name: appOpeningFirstWebBusinessProfile
+      - column_name: firstAppOpeningWebBusinessProfile
+      - column_name: firstAppOpeningFirstWebBusinessProfile
+      - column_name: firstSessionTrafficControlMap
+      - column_name: appOpeningWebTrafficControlMap
+      - column_name: appOpeningFirstWebTrafficControlMap
+      - column_name: firstAppOpeningWebTrafficControlMap
+      - column_name: firstAppOpeningFirstWebTrafficControlMap
+
+      # --- Country cluster (3 attribution models) ---
+      # Physical columns on datamart.jc_sessions_datamart_view since 2026-09-09
+      # (jetcost-bi task 86cbam9e2). Until then they were computed dimensions in
+      # computed.yml; the mapping now has exactly ONE definition, the view's DDL
+      # (jetcost-bi resources/queries/datamart/jc_sessions_datamart_view_create.sql),
+      # which is also what Superset dataset 11 serves. Do NOT re-add a computed
+      # copy here — two definitions of this mapping is precisely what this move
+      # was meant to end.
+      # A fourth column, sessionContentCountryCluster, was removed from the
+      # view's DDL on 2026-09-25: do not look for it or rebuild it.
+      # Each column maps a country-language locale into macro clusters: LATAM,
+      # GERMANIC, NORDICS, OTHER-EU; single-market IT, FR, ES, UK, NL, PT, IE,
+      # CA-EN, CA-FR; US split by Local/Ext into US-EN-LOC, US-EN-EXT, US-ES-LOC,
+      # US-ES-EXT; plus the RoW fallback. 18 distinct values over 2026-09-01..27.
+      # Which locale is used depends on the campaign of that attribution model:
+      #   - real campaigns: the campaign's own *CountryDetail and *LocalVsExt,
+      #     i.e. the market-locale the campaign targets;
+      #   - campaigns flagged `technical` in the campaign registry (the 24 vrt_*
+      #     virtual campaigns of direct, referral, AI assistant referral
+      #     (vrt_ai_assistant_*, since 2026-10-22), organic and not-found traffic,
+      #     ~76% of sessions) have no target of their own — their CountryDetail
+      #     reads 'undefined' — so the SESSION's market is used instead
+      #     (country + language), with LOC/EXT from `Country - Is Local`.
+      # The view computes this at query time from the current registry, so the
+      # rule applies to the whole history, not from a date onwards.
+      # Which column to use depends on the attribution model being analysed — see
+      # ATTRIBUTION MODELS in the glossary above.
+      # ⚠️ 'RoW' is the FALLBACK bucket, not a market group: every locale the
+      # mapping does not name lands there. Share of sessions in RoW over
+      # 2026-09-01..27: sessionCampaign 11,32%, lastClickNotDirectCampaign 11,33%,
+      # userBasedCampaign 11,60% (sessionCampaign on paid 0,38%, on notpaid
+      # 14,57%). 99% of it is technical-campaign traffic on markets the mapping
+      # does not group: in-en, sg-en, za-en, au-en, th-en, nz-en, hk-en, ph-en,
+      # id-en, my-en, kr-ko, and also ve-es, uy-es, bo-es (~0,3M sessions), which
+      # are Latin American but NOT in LATAM (LATAM is ar, br, cl, co, mx, pe
+      # only). Never report RoW as a market: break it down by `country` and
+      # `language` first.
+      # ⚠️ Until 2026-09-28 the cluster used CountryDetail for every campaign, so
+      # all non-campaign traffic sat in RoW (~75% of sessions) and the cluster was
+      # only usable on paid. Numbers, notes or queries from before that date
+      # that filter to paid "because RoW is polluted" are no longer needed.
+      # ⚠️ CountryDetail is the CAMPAIGN's target market-locale, NOT the session's
+      # market (`country`/`language`) and NOT the user's geography (`countryUser`).
+      # EXT campaigns buy users outside the target market on purpose, so one value
+      # spreads over many markets, and the field carries locales that are not
+      # Jetcost markets at all ('be-fr', 'ch-fr', 'ma-fr', 'de-tr', 'cr-es'). Never
+      # use it as a market list or as a proxy for market — group by `country` (plus
+      # `language` for US and CA) when the question is about the market. See
+      # core/business/markets.md in the domain bundle. The cluster inherits this
+      # on real campaigns only: on technical ones it IS the session's market, so
+      # one column mixes the two notions — split by *PaidVsNotPaid when that
+      # matters.
+      # ⚠️ NORDICS is small because the Nordics carry little SEM spend, NOT
+      # because of a mapping gap — do not read a small NORDICS as a data defect.
+      # Until 2026-09-19 every Nordic CountryDetail value read 0 cost; from the
+      # week of 2026-09-20 dk-da carries paid search (a few hundred to ~1,400 EUR
+      # a week through mid-October 2026), se-sv had one week, no-* and fi-fi none.
+      # ⚠️ sessions ONLY. These three columns live on the sessions view and on no
+      # other datamart, so searches, clicks and impressions each exclude them
+      # under `not_inherited_dimensions`.
+      - column_name: sessionCampaignCountryCluster
+      - column_name: userBasedCampaignCountryCluster
+      - column_name: lastClickNotDirectCampaignCountryCluster
+
+      # --- Diagnostic / unverified ---
+      # These three exist on the tables but have NO entry in raw_catalog, so their
+      # semantics are not authoritatively documented anywhere. Declared here for
+      # inventory completeness only — verify with the datamart owner before using
+      # either one in analysis.
+      - column_name: userBasedClusterDebug  # branch list (01-13, 96-99) in the userBasedCluster comment above
+      - column_name: lastClickNotDirectDebug
+      - column_name: userSessionEnhancedHistoryLast90Days
+    metrics:
+      - column_name: sessions
+      - column_name: sessionsWithClickCoreFlight
+      # These three ALREADY EXCLUDE automatic searches: the sessions datamart's build
+      # query filters them upstream, with "autosearchId IS NULL AND toBool(autoRelaunch)
+      # = false". So STR, CTR Core, LTB and every other metric built on them is
+      # autosearch-free by construction — there is nothing to add here, and
+      # automaticSearch is a search-grain dimension that does not exist on sessions.
+      # This is why R018 exists: filtering the searches datamart the same way is what
+      # keeps the two sides comparable (see R018 for the reconciliation figures).
+      - column_name: searches
+      - column_name: searchesFlight
+      - column_name: searchesCar
+      - column_name: amc3
+      - column_name: clicksCoreFlight
+      - column_name: clicksMalFlight
+      - column_name: clicksMalCoreFlight
+      - column_name: clicksMalMediaFlight
+      - column_name: amc3Car
+      - column_name: amc3DynamicPackage
+      - column_name: conversionsDynamicPackage
+      - column_name: clicksMalDynamicPackage
+      - column_name: clicksMalCoreDynamicPackage
+      - column_name: clicksMalMediaDynamicPackage
+      - column_name: impressionsItineraryCug
+      - column_name: impressionsIntercard
+      # Web-to-app openings attributed to the WEB session that generated them: the
+      # build joins etl2.modeled_jc_app_openings_data on webSession = sessionId, so
+      # they sit on web rows, never on app rows. CONSENT-ONLY BY CONSTRUCTION — that
+      # join key is filled only when the W2A handoff carried the web identifiers,
+      # i.e. only for webOriginType = 'Consented' (checked on the full table history:
+      # a non-null webSession appears outside 'Consented' on 100 rows lifetime, all
+      # <= 2025). Two consequences to state whenever these are reported:
+      #   - they UNDERCOUNT real W2A volume. The unconsented 'muk' fallback exists
+      #     since 2025-07-24 and is 32% of consented + unconsented openings in 2026;
+      #     before that date unconsented openings fell into 'webOriginFalse' and are
+      #     not measurable at all. 'Unidentified' openings (w2a code only, from
+      #     2026-09-02) carry no web session either and are missing too.
+      #   - 'Consented' means the web ids were propagated, not that a consent record
+      #     was verified: ~0.6% of these openings land on sessions with every
+      #     iubenda* NULL (no consent record at all, mostly FR/IT/US).
+      # Exactly = fromWebFirstAppOpenings + fromWebReAppOpenings (landedType has only
+      # those two values). Aggregate with SUM. ~29-41k/month, May-Aug 2026.
+      - column_name: fromWebAppOpenings
+      - column_name: revenueOperationalCore
+      - column_name: revenueOperationalMal
+      - column_name: revenueOperationalCoreFlight
+      - column_name: revenueOperationalCoreDynamicPackage
+      - column_name: revenueOperationalMalCar
+      - column_name: revenueCurrentCore
+      - column_name: revenueCurrentCoreDynamicPackage
+      - column_name: clicksCoreModelCpc
+      - column_name: revenueCurrentCoreModelCpc
+      - column_name: revenueCurrentCoreModelCpa
+      - column_name: revenueOperationalCoreModelCpa
+      - column_name: conversionsFlight
+      - column_name: commissionValueCalculatedFlight
+      - column_name: impressionsItineraryCore
+      - column_name: impressionsMalPromobox
+      - column_name: commissionValueCalculatedTheoreticalFlight
+      - column_name: commissionValueCalculatedTheoreticalDynamicPackage
+      - column_name: reAppOpenings
+      - column_name: revenueEcpcCore
+      - column_name: revenueEcpcCoreCar
+      - column_name: revenueEcpcMalCar
+      - column_name: revenueEcpcMalDynamicPackage
+      - column_name: revenueEcpcCoreModelCpc
+      - column_name: sessionsWithSearch
+      - column_name: sessionsWithSearchFlight
+      - column_name: sessionsWithClickCoreCar
+      - column_name: sessionsWithClickCoreDynamicPackage
+      - column_name: clicksCore
+      - column_name: commissionValueCalculated
+      - column_name: amc3Flight
+      - column_name: commissionValueCalculatedCar
+      - column_name: commissionValueCalculatedTheoreticalCar
+      # landedType = 'app-installed': first opening after the install. Subset of
+      # fromWebAppOpenings, same grain and same consent-only caveat (see there).
+      # 34% of the trio on sessions (Aug 2026). Aggregate with SUM.
+      - column_name: fromWebFirstAppOpenings
+      - column_name: appOpenings
+      - column_name: firstAppOpenings
+      - column_name: revenueOperationalCoreCar
+      - column_name: revenueOperationalMalFlight
+      - column_name: revenueEcpcMal
+      - column_name: revenueEcpcCoreFlight
+      - column_name: revenueEcpcMalFlight
+      - column_name: revenueEcpcCoreDynamicPackage
+      - column_name: revenueCurrentCoreFlight
+      - column_name: revenueCurrentCoreCar
+      - column_name: clicksCoreModelCpa
+      - column_name: sessionsWithSearchCar
+      - column_name: sessionsWithSearchDynamicPackage
+      - column_name: searchesDynamicPackage
+      - column_name: clicksMal
+      - column_name: clicksMalCore
+      - column_name: clicksMalMedia
+      - column_name: conversions
+      - column_name: conversionsCar
+      - column_name: clicksMalCar
+      - column_name: clicksMalCoreCar
+      - column_name: clicksMalMediaCar
+      - column_name: clicksCoreCar
+      - column_name: commissionValueCalculatedDynamicPackage
+      - column_name: clicksCoreDynamicPackage
+      - column_name: impressionsMinicar
+      # landedType = 'app-opened': re-opening of an app already installed. Subset of
+      # fromWebAppOpenings, same grain and same consent-only caveat (see there).
+      # 66% of the trio on sessions (Aug 2026). Aggregate with SUM.
+      - column_name: fromWebReAppOpenings
+      - column_name: revenueOperationalMalDynamicPackage
+      - column_name: revenueEcpcCoreModelCpa
+      - column_name: revenueOperationalCoreModelCpc
+      - column_name: searchesBlocked   # attr 1255, UInt64, since 2026-06-10 (registry; non-zero values observed from 2026-06-09). Searches blocked by a blocking element, with no corresponding search after the blocking flow (e.g. W2A). Aggregate with SUM.
+      # Current MAL revenue — total and per-product. Same Core/Media split as
+      # revenueCurrentMalCore/revenueCurrentMalMedia documented on searches.
+      - column_name: revenueCurrentMal
+      - column_name: revenueCurrentMalFlight
+      - column_name: revenueCurrentMalCar
+      - column_name: revenueCurrentMalDynamicPackage
+      # Impression counters, same family as impressionsItinerary*/impressionsIntercard
+      # above (Argo rules: >=1s visible, >=50% of the element in viewport).
+      - column_name: impressionsDetailPageCore
+      - column_name: impressionsDetailPageCug
+      - column_name: impressionsInterstitial   # UInt64. ALL interstitials triggered in the session — result page and other pages alike. Broader than the searches column of the same name (result page only), so the two do NOT reconcile. Web since 2026-06-18 (catalog; a partial-day trickle exists on 06-17); app since v4.47.0, values ramp 2026-07-01 → ~07-12. Aggregate with SUM.
+      # Pro-rata columns, exposed by datamart.jc_sessions_datamart_view only (§2.1).
+      # Each one is already multiplied by sessions, so they are summed directly:
+      # SUM(revenueCurrentProRataMal), never SUM(revenueCurrentProRataMal * sessions).
+      # They replace the dictGet('config.dict_meta_*_rps'/'*_cps', ...) * sessions
+      # expressions the metrics in computed.yml used to carry inline.
+      - column_name: revenueCurrentProRataMal
+      - column_name: revenueCurrentProRataMalCore
+      - column_name: revenueCurrentProRataMalMedia
+      - column_name: revenueCurrentProRataGam
+      - column_name: revenueCurrentProRataNetGam
+      - column_name: revenueCurrentProRataMedia
+      - column_name: revenueCurrentProRataNetMedia
+      - column_name: revenueCurrentProRataAfs
+      - column_name: revenueCurrentProRataAm
+      - column_name: revenueCurrentProRataAu
+      - column_name: revenueCurrentProRataDataMonetization
+      # revenueCurrentCore + ProRataMal + ProRataNetMedia + ProRataDataMonetization,
+      # computed row by row: the pro-rata revenue total.
+      - column_name: revenueCurrentProRataTotal
+      # Marketing pro-rata: GAds, Ds, NotSem and their Mktg total. The *Mktg and
+      # *GAds ones already sum the performance_marketing_cps and ads_geo_cps slices,
+      # which never overlap (GAds moved to the geo pipeline on 2026-01-01).
+      # NotSem has the cost only: its clicks and impressions are counted in
+      # clicksProRataMktg and impressionsProRataMktg.
+      # Context: cost lands on web sessions only, with two exceptions.
+      #   - App-install campaigns (web_vs_app = 'app' in the campaign registry):
+      #     on the app sessions carrying the campaign. GAds from 2026-09-07.
+      #     NotSem from 2026-10-26, today Apple Ads only (sessionCampaignSource =
+      #     'apple'): its spend starts 2026-10-22, but the app writes the Apple Ads
+      #     campaign in sessionCampaign only from 2026-10-26, so the 22-25 Oct
+      #     spend reaches no session. Device: iPhone -> phone, iPad -> tablet; a
+      #     campaign-day Apple does not split by device goes to phone.
+      #     A campaign-day with no matching app session drops out of this datamart
+      #     (2.86 of 20.71 EUR of Apple Ads on 2026-10-26).
+      #   - OIA campaigns (oia flag in the registry, sessionCampaignIsOia): the ad
+      #     opens the app when installed, the web otherwise, so the cost of each
+      #     (date, device, campaign) tuple (+ countryUser from 2026) is spread over
+      #     its web AND app sessions with one cost per session. This includes app
+      #     sessions reached through the web (appOpeningWebOrigin = true: W2A or
+      #     the /oia/ redirect), which for any other campaign read 0. They take
+      #     about a quarter of OIA app cost in 2026 and 40-50% in 2023-2025.
+      #     Restated in October 2026 back to 2023-01, the first pro-rata month.
+      #     Before 2023-07 app sessions rarely carry the web campaign, so the app
+      #     share there is under 1%; from then on it is 3-5% of OIA GAds cost. The
+      #     flag is today's registry value, with no history.
+      #     Clicks, impressions and conversions pro-rata follow the same split, so
+      #     conversionsProRataGAds on OIA app sessions is an allocation by sessions,
+      #     not the conversions Google measured in the app (android-/ios-core-sgtm).
+      # Ds and NotSem keep OIA app sessions at 0: Bing OIA app sessions are under
+      # 0.1% of Bing OIA sessions.
+      - column_name: clicksProRataGAds
+      - column_name: impressionsProRataGAds
+      - column_name: conversionsProRataGAds
+      - column_name: costProRataGAds
+      - column_name: clicksProRataDs
+      - column_name: impressionsProRataDs
+      - column_name: costProRataDs
+      - column_name: costProRataNotSem
+      - column_name: clicksProRataMktg
+      - column_name: impressionsProRataMktg
+      - column_name: costProRataMktg
+  searches:
+    # The three *CountryCluster columns are physical on the sessions view
+    # (datamart.jc_sessions_datamart_view) and on nothing else, so the
+    # sessions inheritance has to be cut here — see the Country cluster
+    # block under sessions. The same holds for the seven
+    # firstSessionFirstFlightSearch* columns (user's first flight search),
+    # physical on the sessions tables only. Querying any of them against
+    # searches fails.
+    not_inherited_dimensions:
+      - sessionCampaignCountryCluster
+      - userBasedCampaignCountryCluster
+      - lastClickNotDirectCampaignCountryCluster
+      - firstSessionFirstFlightSearchCountryFrom
+      - firstSessionFirstFlightSearchCountryTo
+      - firstSessionFirstFlightSearchIataFrom
+      - firstSessionFirstFlightSearchIataTo
+      - firstSessionFirstFlightSearchIataFromParent
+      - firstSessionFirstFlightSearchIataToParent
+      - firstSessionFirstFlightSearchBookingWindow
+    dimensions:
+      - column_name: continentTo
+      - column_name: nBaby
+      - column_name: nAdults
+      - column_name: goDate
+      - column_name: bookingWindow
+      - column_name: bestDisplayedUnitaryPrice
+      - column_name: pickupName
+      - column_name: pickupCountry
+      - column_name: dropoffNameParent
+      - column_name: recommendedPartnerId
+      - column_name: recommendedPropertyId
+      - column_name: searchRankPerUser          # N-th search (any product) for this user (lifetime counter) — searches/clicks only, NOT on impressions
+      - column_name: searchFlightRankPerUser    # N-th flight search for this user (lifetime counter) — searches/clicks only, NOT on impressions; NULL on searches of any other product
+      - column_name: searchRankPerSession       # N-th search within the current session (resets each session) — searches/clicks only, NOT on impressions
+      - column_name: searchCarRankPerSession    # N-th car search within the current session — searches/clicks only, NOT on impressions; NULL on searches of any other product
+      - column_name: searchPinnedType
+      - column_name: automaticSearchReason      # why the platform re-issued the search. Values are NOT stable over history (legacy 'unknown', 'auto_search', 'sid_expired', 'inactivity_timeout?_' before mid-2026) — never filter on this string, filter on automaticSearch
+      - column_name: isDirect
+      - column_name: searchTriggerSourceDetail   # optional qualifier of the entry point (suggester on app, ar/ow/direct on web) — values in KEY DIMENSIONS above
+      - column_name: airportToParent
+      - column_name: continentFrom
+      - column_name: countryTo
+      - column_name: isDomestic
+      - column_name: class
+      - column_name: yearMonthGoDate
+      - column_name: backDate
+      - column_name: yearMonthBackDate
+      - column_name: flexibleDates            # attr 601, Nullable(String). Coded per-boundary date flexibility, FLIGHT only. NULL = fixed dates (the large majority) or a non-flight row; all-zero codes are NOT NULL yet not flexible — see SEARCH DATE FLEXIBILITY in the glossary above for the code layout and the classification predicates
+      - column_name: bestPartner
+      - column_name: automaticSearch            # Nullable(Bool). true = search re-issued by the platform, not submitted by the user — EXCLUDED BY DEFAULT, see R018 in query-rules.yml. NULL = blocked-search row (searchesBlocked), which carries 0 searches
+      - column_name: tripDuration
+      - column_name: pickupIata
+      - column_name: pickupIataParent
+      - column_name: pickupNameParent
+      - column_name: dropoffIataParent
+      - column_name: displayedProperties
+      - column_name: sortingChanges
+      - column_name: searchTriggerSourcePage     # page the entry point sat on — values in KEY DIMENSIONS above
+      - column_name: distanceKm
+      - column_name: searchFlightRankPerSession  # N-th flight search within the current session (resets each session) — searches/clicks only, NOT on impressions; NULL on searches of any other product
+      - column_name: hasAirlinesOffers
+      - column_name: hasViOffers
+      - column_name: topRoutePercentile
+      - column_name: searchEuroExchangeRate
+      - column_name: product
+      - column_name: iataFromParent
+      - column_name: iataTo
+      - column_name: airportTo
+      - column_name: isAr
+      - column_name: pickupContinent
+      - column_name: dropoffIata
+      - column_name: dropoffName
+      - column_name: dropoffCountry
+      - column_name: pickupDate
+      - column_name: dropoffDate
+      - column_name: cheapestTotalPrice
+      - column_name: recommendedUnitaryPrice
+      - column_name: isCompleted              # Nullable(Bool), FLIGHT only (NULL on other products). CLIENT-SIDE: true = an Argo 'search_complete' event (argo_events.search) exists for this SSID; false = no such event came back (tab closed/abandoned before results, tracking loss). NOT the production search.completed_at, which is almost never NULL — don't compare the two
+      - column_name: haulTypeDistanceCustom
+      - column_name: searchCarRankPerUser       # N-th car search for this user (lifetime counter) — searches/clicks only, NOT on impressions; NULL on searches of any other product
+      - column_name: hasPinnedItinerary
+      - column_name: topParentRoutePercentile
+      - column_name: iataFrom
+      - column_name: airportFrom
+      - column_name: airportFromParent
+      - column_name: iataToParent
+      - column_name: countryFrom
+      - column_name: nPassengers
+      - column_name: nChildren
+      - column_name: bestPrice
+      - column_name: hasResults
+      - column_name: bestDisplayedFlightUnitaryPrice
+      - column_name: dropoffContinent
+      - column_name: isSameLocation
+      - column_name: isPriceOk
+      - column_name: roomsDetail
+      - column_name: cheapestUnitaryPrice
+      - column_name: recommendedTotalPrice
+      - column_name: searchTriggerSource         # UI entry point that started the search (search_form, shared_link, apn…) — values in KEY DIMENSIONS above
+      - column_name: filterChanges            # FLIGHT only (NULL otherwise). Client-side (Argo): number of filter interactions on the results page for this search. 0 = none received, i.e. no filtering or tracking loss
+      - column_name: filterChangesDistinct    # FLIGHT only. Number of distinct filter types touched (stops, airlines, price, times…). Same source and same 0 meaning as filterChanges
+      - column_name: searchDpRankPerUser        # N-th dynamic-package search for this user (lifetime counter) — searches/clicks only, NOT on impressions; NULL on searches of any other product
+      - column_name: searchDpRankPerSession     # N-th dynamic-package search within the current session — searches/clicks only, NOT on impressions; NULL on searches of any other product
+      - column_name: isHighQuality
+      - column_name: clusterParentRoute
+      - column_name: isBookNow
+      - column_name: searchTriggerBlockStrategy   # attr 1252, Nullable(String), since 2026-06-09. Block strategy of the blocked search that led to the current one. Observed values: 'light', 'bold'.
+      - column_name: searchTriggerBlockReason     # attr 1253, Nullable(String), since 2026-06-09. Block reason of the blocked search that led to the current one. Observed values: 'new_paid_booking_window_greater_45', 'new_paid_booking_window_between_21_45', 'searches_limit_1'.
+    metrics:
+      - column_name: amc3
+      - column_name: conversions
+      - column_name: impressionsIntercard
+      - column_name: impressionsItineraryCore
+      - column_name: displayedItineraries
+      - column_name: revenueOperationalCore
+      - column_name: revenueOperationalMal
+      - column_name: revenueEcpcMal
+      - column_name: revenueCurrentMal
+      - column_name: revenueCurrentMalCore
+      - column_name: revenueCurrentMalMedia
+      - column_name: revenueEcpcCoreModelCpc
+      - column_name: revenueOperationalCoreModelCpa
+      - column_name: commissionValueCalculated
+      - column_name: impressionsMalPromobox
+      - column_name: revenueEcpcCore
+      - column_name: clicksCoreModelCpc
+      - column_name: clicksCoreModelCpa
+      - column_name: revenueCurrentCoreModelCpa
+      - column_name: searches
+      - column_name: displayedMalItems
+      - column_name: revenueCurrentCore
+      - column_name: searchesWithClickCore
+      - column_name: clicksMal
+      - column_name: clicksMalCore
+      - column_name: clicksMalMedia
+      - column_name: clicksCore
+      - column_name: impressionsItineraryCug
+      - column_name: commissionValueCalculatedTheoretical
+      - column_name: impressionsMinicar
+      - column_name: displayedItinerariesCug
+      - column_name: displayedCoreItinerariesVi
+      - column_name: displayedItinerariesFallback
+      - column_name: displayedItinerariesHasSelfTransfer
+      - column_name: totalMalItems
+      - column_name: revenueEcpcCoreModelCpa
+      - column_name: revenueCurrentCoreModelCpc
+      - column_name: revenueOperationalCoreModelCpc
+      - column_name: queriedPartners
+      - column_name: queriedPartnersWithOffers
+      # Metrics do NOT inherit (§2.4), so a metric present on more than one table
+      # has to be declared under each. These seven also exist on sessions and are
+      # declared there too — same meaning at this grain, with TWO exceptions, both
+      # narrower here: impressionsInterstitial (result page only here, all pages on
+      # sessions) and the three fromWeb*AppOpenings. See the comments on each.
+      - column_name: searchesBlocked            # attr 1255, UInt64, since 2026-06-10. Searches blocked by a blocking element, with no corresponding search after the blocking flow (e.g. W2A). Aggregate with SUM.
+      - column_name: impressionsDetailPageCore
+      - column_name: impressionsDetailPageCug
+      - column_name: impressionsInterstitial   # UInt64. ONLY interstitials triggered in the result page — narrower than the sessions column, which counts every page. Same availability: web since 2026-06-18 (catalog; partial-day trickle on 06-17), app since v4.47.0 (ramp 2026-07-01 → ~07-12). Aggregate with SUM.
+      # WARNING: NOT the same numbers as the sessions trio, do not compare or sum the
+      # two sides. Here the opening must ALSO carry the web flight-search id — the
+      # searches build adds "webSearchId (= webFlightSsid) IS NOT NULL" and joins it
+      # to searchId — so each opening is attributed to the single search that produced
+      # it. webFlightSsid is set on 43% of consented 'app-installed' openings but on
+      # only 1.2% of 'app-opened' ones, so searches keeps ~15% of the sessions volume
+      # and is de facto install-only: Aug 2026 = 4,987 here (4,744 first / 243 re) vs
+      # 33,509 on sessions (11,381 / 22,128).
+      # Use sessions for W2A volume; use searches only to attribute an opening to the
+      # route/search that generated it. The consent-only caveat documented on the
+      # sessions trio applies here unchanged.
+      - column_name: fromWebAppOpenings
+      - column_name: fromWebFirstAppOpenings
+      - column_name: fromWebReAppOpenings
+  clicks:
+    # The three *CountryCluster columns are physical on the sessions view
+    # (datamart.jc_sessions_datamart_view) and on nothing else, so the
+    # sessions inheritance has to be cut here — see the Country cluster
+    # block under sessions. The same holds for the seven
+    # firstSessionFirstFlightSearch* columns (user's first flight search),
+    # physical on the sessions tables only. Querying any of them against
+    # clicks fails.
+    not_inherited_dimensions:
+      - sessionCampaignCountryCluster
+      - userBasedCampaignCountryCluster
+      - lastClickNotDirectCampaignCountryCluster
+      - firstSessionFirstFlightSearchCountryFrom
+      - firstSessionFirstFlightSearchCountryTo
+      - firstSessionFirstFlightSearchIataFrom
+      - firstSessionFirstFlightSearchIataTo
+      - firstSessionFirstFlightSearchIataFromParent
+      - firstSessionFirstFlightSearchIataToParent
+      - firstSessionFirstFlightSearchBookingWindow
+    dimensions:
+      - column_name: clickCategory
+      - column_name: partner
+      - column_name: groupCode
+      - column_name: cardPosition
+      - column_name: integrationType
+      - column_name: integrationSubType
+      - column_name: businessModel
+      - column_name: groupConversionApiEnabled
+      - column_name: groupConversionsAvailableSinceDate
+      - column_name: partnerCode
+      - column_name: bookingDate
+      - column_name: outboundIataTo
+      - column_name: outboundDurationMinutes
+      - column_name: outboundStops
+      - column_name: inboundDatetime
+      - column_name: inboundIataTo
+      - column_name: inboundAirlines
+      - column_name: filters
+      - column_name: filterStepCount          # Client-side (Argo): number of filter interactions before this click/impression. Can be > 0 with filtersApplied = 0 (filters touched, then removed)
+      - column_name: cugOffersCount
+      - column_name: baggagesInfoChecked
+      - column_name: baggagesInfoHand
+      - column_name: clickRankPerUser              # N-th click (any type) for this user (lifetime counter)
+      - column_name: revenueCoreCumulativePerUser   # cumulative Core (clickCategory 1001) revenue for this user (lifetime, up to this click); NULL on every non-Core click
+      - column_name: clickNotCoreRankPerSession     # N-th click of THIS click's own non-Core clickCategory within the session — NOT the N-th non-Core click; NULL on Core clicks (see FAMILY-SCOPED COLUMNS)
+      - column_name: clickNotCoreRankPerSearch      # N-th click of THIS click's own non-Core clickCategory within the search — NOT the N-th non-Core click; NULL on Core clicks
+      - column_name: revenueCoreCumulativePerSearch # cumulative Core (clickCategory 1001) revenue within the current search; NULL on every non-Core click
+      - column_name: conversionRankPerUser          # N-th conversion (booking) for this user (lifetime counter); NULL on every click without a booking
+      - column_name: conversionRankPerSearch        # N-th conversion within the current search; NULL on every click without a booking
+      - column_name: partnerIsAirline   # Nullable(Bool), FLIGHT only (always NULL on CAR/DP). Web since 2025-04-10 (partial day, 57% NULL; complete from 04-11); app since v4.46.0 — first non-NULL click 2026-06-18, and devices still on older builds keep sending NULL (pre-4.46 = 99% NULL in Aug 2026).
+      #   ⚠️ NOT a clean airline-vs-OTA split: 19.5% of core FLIGHT clicks are NULL over 2026-06→2026-08 (app 16%, web 4-5%) and the NULL bucket holds airlines and OTAs alike, so `= false` silently drops that volume while `= false OR IS NULL` leaks airlines back in. Beyond the app version gate, a residual offer-enrichment gap nulls this column together with isSelfTransfer (~5% web, ~11% app on v4.46.0+). Report the NULL share whenever you cut on it.
+      - column_name: isPinned
+      - column_name: pinnedType
+      - column_name: paymentMethodFeesCountZero
+      - column_name: partnerQualityValidSurveysNumber
+      - column_name: partnerQualityScore
+      - column_name: isViDisplayed
+      - column_name: ruleExpiryDate
+      - column_name: ruleCpaPercentageMinThreshold
+      - column_name: groupInvoicing
+      - column_name: groupInvoicingCompany
+      - column_name: price
+      - column_name: sortingPosition
+      - column_name: unitaryPrice
+      - column_name: itineraryBadge
+      - column_name: filtersApplied           # Client-side (Argo): number of filters active at click/impression time (the list is in `filters`). A state, not an interaction count — see filterStepCount
+      - column_name: baggagesInfoCabin
+      - column_name: euroExchangeRate
+      - column_name: clickNotCoreRankPerUser         # lifetime N-th click of THIS click's own non-Core clickCategory — NOT the N-th non-Core click; NULL on Core clicks
+      - column_name: revenueCumulativePerUser         # cumulative total revenue for this user (lifetime)
+      - column_name: revenueNotCoreCumulativePerUser  # cumulative revenue of THIS click's own non-Core clickCategory for this user (lifetime) — not of all non-Core clicks; NULL on Core clicks
+      - column_name: clickRankPerSession              # N-th click (any type) within the current session
+      - column_name: revenueNotCoreCumulativePerSession  # cumulative revenue of THIS click's own non-Core clickCategory within the session — not of all non-Core clicks; NULL on Core clicks
+      - column_name: clickRankPerSearch               # N-th click (any type) within the current search
+      - column_name: clickCoreRankPerSearch           # N-th Core (clickCategory 1001) click within the current search; NULL on every non-Core click
+      - column_name: paymentMethodFeesCount
+      - column_name: ruleValidFrom
+      - column_name: groupOrigin
+      - column_name: network
+      - column_name: networkPartner
+      - column_name: companyGo
+      - column_name: companyBack
+      - column_name: transportationType
+      - column_name: cpcSource
+      - column_name: groupNavisionId
+      - column_name: partnerCodeBS
+      - column_name: conversionType
+      - column_name: ipProxy
+      - column_name: rankingPosition     # position of this offer on the SERP (1 = top result); NOT a lifecycle counter — use click*Rank* for those
+      - column_name: totalPrice
+      - column_name: inboundDurationMinutes
+      - column_name: inboundStops
+      - column_name: sortingStepCount
+      - column_name: stepCount
+      - column_name: offersCount
+      - column_name: hasBaggagesInfo
+      - column_name: clickCoreRankPerUser             # N-th Core (clickCategory 1001) click for this user (lifetime counter); NULL on every non-Core click
+      - column_name: revenueCumulativePerSession       # cumulative total revenue within the current session
+      - column_name: revenueCoreCumulativePerSession   # cumulative Core (clickCategory 1001) revenue within the current session; NULL on every non-Core click
+      - column_name: revenueCumulativePerSearch        # cumulative total revenue within the current search
+      - column_name: revenueNotCoreCumulativePerSearch # cumulative revenue of THIS click's own non-Core clickCategory within the search — not of all non-Core clicks; NULL on Core clicks
+      - column_name: conversionRankPerSession          # N-th conversion within the current session; NULL on every click without a booking
+      - column_name: commissionValueCalculatedCumulativePerUser  # cumulative calculated commission for this user (lifetime); NULL on every click without a booking
+      - column_name: paymentMethodFeesCountNotZero
+      - column_name: paymentMethodFeesMax
+      - column_name: isVi
+      - column_name: isSelfTransfer                     # replaces isVi/isViDisplayed (catalog attr 1257), web since 2026-06-25
+      - column_name: ruleValidTo
+      - column_name: ruleValue
+      - column_name: ruleMinCpcCurrency
+      - column_name: ruleMinCpc
+      - column_name: minCpc                           # Min CPC value provided for *_min_cpc buiness models. Always in EUR, available since 2026-05-01.
+      - column_name: ruleCpaPercentageMaxThreshold
+      - column_name: partnerBrand
+      - column_name: pagePosition
+      - column_name: groupPrepaid
+      - column_name: ruleBusinessModel
+      - column_name: hasConversion
+      - column_name: ipHosting
+      - column_name: elementType
+      - column_name: outboundDatetime
+      - column_name: outboundIataFrom
+      - column_name: outboundAirlines
+      - column_name: inboundIataFrom
+      - column_name: transportationTypeNew
+      - column_name: sorting
+      - column_name: clickCoreRankPerSession          # N-th Core (clickCategory 1001) click within the current session; NULL on every non-Core click
+      - column_name: commissionValueCalculatedCumulativePerSession  # ⚠️ NOT a per-session cumulative: the ETL seeds the window with the user's LIFETIME commission (lastCommissionValueCalculatedCumulativePerUser) before summing the session, so 56% of first-conversion-of-session rows differ from the click's own commissionValueCalculated (avg +23.6 EUR, 2026-09-01→20). Use commissionValueCalculated, or the PerUser column. NULL on clicks without a booking.
+      - column_name: commissionValueCalculatedCumulativePerSearch   # same lifetime-seeding defect as the PerSession column above; NULL on clicks without a booking
+      - column_name: paymentMethod
+      - column_name: paymentMethodFees
+      - column_name: itineraryTags
+      - column_name: bookingPassengers
+      - column_name: ruleId
+      - column_name: ruleCurrency
+      - column_name: groupBookingAvailability
+      - column_name: isSponsored
+      - column_name: isFallback                       # ⚠️ WEB ONLY: NULL on 100% of app clicks (deviceType = 'app'), although the CPA fallback does run on app (displayedItinerariesFallback > 0 on app searches in US/CA/UK). App fallback clicks cannot be told apart from regular CPA ones, and a filter isFallback = 0 silently drops every app click. Split fallback vs regular on web clicks only. On web, set on Core (1001) clicks; NULL on every other clickCategory and on Core clicks with an empty elementType.
+      - column_name: partnerBadges  # String, Partner Reputation Badges. Still empty since this has not been release.
+    metrics:
+      - column_name: revenueOperational
+      - column_name: revenueCurrent
+      - column_name: commissionValueCalculated
+      - column_name: conversions
+      - column_name: clicks
+      - column_name: commissionValueCalculatedTheoretical
+      - column_name: amc3
+      - column_name: revenueEcpc
+
+  # ============================================================
+  # IMPRESSIONS DATAMART — see IMPRESSION-LEVEL SPECIFICS in glossary above
+  # Table: datamart.jc_impressions_datamart
+  # Grain: Impression-level (each row = one itinerary displayed to a user)
+  # Inherits dimensions from searches + sessions (parallel to clicks), EXCEPT
+  # the ones listed under `not_inherited_dimensions` below.
+  # ============================================================
+  impressions:
+    # Dimensions that the searches/sessions inheritance would otherwise imply,
+    # but which do NOT exist on this table. Confirmed against both ClickHouse
+    # and raw_catalog (which maps these columns to jc_searches_datamart and
+    # jc_clicks_datamart only) — impressions carries no search-grain rank.
+    # Querying any of these against impressions fails.
+    #   *RankPerUser    → use the userSearch*RankPerUser form instead, which IS
+    #                     present here (user-lifetime scope, see RANK DIMENSIONS)
+    #   *RankPerSession → no equivalent on impressions at all
+    #   *CountryCluster → physical on the sessions view only (see the Country
+    #                     cluster block under sessions); nothing equivalent here
+    #   firstSessionFirstFlightSearch* → physical on the sessions tables only;
+    #                     for the route of the current search use the bare
+    #                     countryFrom/iataFrom/... columns
+    # semantic-checker reads this list (agents/semantic-checker/clickhouse-coverage.js)
+    # and validates it: an entry that turns up on the table, or that no ancestor
+    # actually declares, is reported as a finding rather than silently honoured.
+    not_inherited_dimensions:
+      - searchRankPerUser
+      - searchFlightRankPerUser
+      - searchCarRankPerUser
+      - searchDpRankPerUser
+      - searchRankPerSession
+      - searchFlightRankPerSession
+      - searchCarRankPerSession
+      - searchDpRankPerSession
+      - sessionCampaignCountryCluster
+      - userBasedCampaignCountryCluster
+      - lastClickNotDirectCampaignCountryCluster
+      - firstSessionFirstFlightSearchCountryFrom
+      - firstSessionFirstFlightSearchCountryTo
+      - firstSessionFirstFlightSearchIataFrom
+      - firstSessionFirstFlightSearchIataTo
+      - firstSessionFirstFlightSearchIataFromParent
+      - firstSessionFirstFlightSearchIataToParent
+      - firstSessionFirstFlightSearchBookingWindow
+    dimensions:
+      # --- Impression classification ---
+      - column_name: impressionType
+      - column_name: impressionSubType
+      # --- Hero offer ---
+      - column_name: heroPartnerCode
+      - column_name: heroGroupCode
+      - column_name: sortingPosition
+      - column_name: heroUnitaryPrice
+      - column_name: heroDiscountedUnitaryPrice
+      - column_name: heroTotalPrice
+      - column_name: heroDiscountedTotalPrice
+      - column_name: heroDiscount
+      - column_name: heroPaymentMethod
+      - column_name: heroPaymentMethodFees
+      - column_name: heroPaymentMethodFeesCount
+      - column_name: heroPaymentMethodFeesCountZero
+      - column_name: heroPaymentMethodFeesCountNotZero
+      - column_name: heroPaymentMethodFeesMax
+      - column_name: heroPartnerQualityValidSurveysNumber
+      - column_name: heroPartnerQualityScore
+      - column_name: heroIsAirline           # hero offer: partner is an airline. Nullable(Bool), FLIGHT only.
+      #   Web: populated for the whole retained window — NULL there means only that the impression has no hero partner (non-itinerary impressionTypes); the NULL count matches heroPartnerCode exactly.
+      #   App: NULL before v4.46.0 — first non-NULL 2026-06-18, ramping through July 2026, so an app cut over the earlier part of the window returns nothing. Same airline-vs-OTA caveat as the clicks entry above.
+      - column_name: isSelfTransfer        # itinerary-level self transfer flag (attr 1257); same value across all offers
+      - column_name: heroIsSponsored
+      - column_name: isUniqueContent
+      - column_name: area
+      - column_name: transportationType
+      - column_name: filters
+      - column_name: filterStepCount          # Client-side (Argo): number of filter interactions before this click/impression. Can be > 0 with filtersApplied = 0 (filters touched, then removed)
+      - column_name: filtersApplied           # Client-side (Argo): number of filters active at click/impression time (the list is in `filters`). A state, not an interaction count — see filterStepCount
+      # --- Itinerary legs ---
+      # Itinerary-level, not offer-level: same value across all offers of the row.
+      # Declared identically under `clicks` — the two are siblings and both carry
+      # these, so each has to declare them (dimensions inherit downwards only).
+      - column_name: outboundDatetime
+      - column_name: outboundIataFrom
+      - column_name: outboundIataTo
+      - column_name: outboundAirlines
+      - column_name: outboundStops
+      - column_name: outboundDurationMinutes
+      - column_name: inboundDatetime
+      - column_name: inboundIataFrom
+      - column_name: inboundIataTo
+      - column_name: inboundAirlines
+      - column_name: inboundStops
+      - column_name: inboundDurationMinutes
+      # --- Baggage info (hero offer) ---
+      - column_name: hasBaggagesInfo
+      - column_name: baggagesInfoChecked
+      - column_name: baggagesInfoCabin
+      - column_name: baggagesInfoHand
+      # --- Pinned / self-transfer flags ---
+      - column_name: isPinned
+      - column_name: pinnedType
+      - column_name: heroIsVi                 # historical; from 2026-06-25 use isSelfTransfer for new data
+      - column_name: heroIsViDisplayed        # historical; superseded by isSelfTransfer (attr 1257)
+      # --- Itinerary tagging ---
+      - column_name: itineraryBadge
+      - column_name: itineraryTags
+      # --- Offer counts on the row ---
+      - column_name: offersCount
+      - column_name: cugOffersCount
+      # --- Result-page interaction ---
+      - column_name: sorting
+      - column_name: sortingStepCount
+      - column_name: stepCount
+      # --- Pricing ---
+      - column_name: euroExchangeRate
+      # --- Promobox ---
+      - column_name: promoboxPartnerId
+      - column_name: promoboxPartnerName
+      - column_name: promoboxNetworkId
+      - column_name: promoboxNetworkName
+      - column_name: promoboxPrice
+      - column_name: promoboxIataFrom
+      - column_name: promoboxIataTo
+      # --- Clicked offer reference ---
+      - column_name: clickedPartner
+      - column_name: clickedGroupCode
+      # --- All other offers ---
+      # Array(Nullable(String)): one JSON per offer, hero excluded. Populated from
+      # 2026-07-01, only for impressionType itinerary_core/itinerary_cug.
+      # NOT usable as a plain dimension — see rule R014 in query-rules.yml.
+      - column_name: otherOffers
+    metrics:
+      - column_name: impressions
+      - column_name: impressionsDetailPage
+      - column_name: clicks
+      - column_name: clicksCore
+      - column_name: clicksMal
+      - column_name: clicksMalCore
+      - column_name: clicksMalMedia
+      - column_name: revenueEcpcCore
+      - column_name: revenueCurrentCore
+      - column_name: revenueEcpcMal
+      - column_name: revenueCurrentMal
+      - column_name: revenueCurrentMalCore
+      - column_name: revenueCurrentMalMedia
+      - column_name: conversions
+      - column_name: commissionValueCalculatedTheoretical
+      - column_name: commissionValueCalculated
+      - column_name: amc3
+
+
+  # ============================================================
+  # USERS DATAMART
+  # ============================================================
+  # Grain: Pre-aggregated unique user counts by dimensions and funnel step
+  # Table: datamart.jc_users_datamart
+  #
+  # ⚠️ WHEN TO USE THIS DATAMART
+  #   Use EXCLUSIVELY when the user asks a USER-BASED question
+  #   (e.g., "how many users", "unique visitors", "new vs returning users",
+  #    "user funnel", "user counts by step").
+  #   For all other questions, use the main funnel datamarts.
+  #
+  # ⚠️ FULLY INDEPENDENT — does NOT participate in the dimension hierarchy.
+  #   Does NOT inherit dimensions from sessions/searches/clicks/impressions.
+  #   ALL available dimensions are listed explicitly below.
+  #
+  # ⚠️ MANDATORY FILTERS:
+  #   1. ALWAYS filter by `timeGrain` (Daily / Weekly / Monthly)
+  #      Without this, counts are DUPLICATED and meaningless.
+  #   2. ALWAYS filter by `step` to specify the funnel stage.
+  #
+  # The `users` column is ALREADY a pre-aggregated count.
+  # Use SUM(users) to aggregate across dimensions.
+  #
+  # --- timeGrain ---
+  #   values: [Daily, Weekly, Monthly]
+  #
+  # --- step (funnel stages) ---
+  #   values: [01. Session Qualified,
+  #            02. Flight Search,
+  #            03. Flight Impression Detail Page,
+  #            04. Flight Click Core, 05. Flight Booking]
+  #
+  # --- isFirstUser ---
+  #   values: [true, false]  (new vs returning user)
+  #
+  # --- firstSessionDate ---
+  #   Date of the user's very first session (lifetime).
+  #
+  # --- Attribution: last-click-not-direct ---
+  # lastClickNotDirectCampaign{PaidVsNotPaid|Source|Medium|ChannelGroup}
+  #
+  # --- Attribution: first session — campaign channel ---
+  # firstSessionSessionCampaign{PaidVsNotPaid|Source|Medium|ChannelGroup}
+  #   Attribution data from the user's very first session (campaign/marketing channel).
+  #
+  # --- Attribution: first session — content channel ---
+  # firstSessionSessionContent{PaidVsNotPaid|Source|Medium|ChannelGroup}
+  #   Attribution data from the user's very first session (content/product channel).
+  #
+  # --- User-level rank/cumulative (for segmentation) ---
+  # Same semantics as in other datamarts (e.g., userSessionRankPerUser = nth session for this user).
+  # Use these to segment users (e.g., "users with at least 3 sessions").
+  # ============================================================
+  users:
+    dimensions:
+      # --- Users-specific dimensions ---
+      - column_name: timeGrain
+      - column_name: step
+      - column_name: isFirstUser
+      - column_name: pagesNameList                    # Array(String): pages (web) / screens (app) of ALL the user's sessions in the period plus the day before it (not only qualified ones, whatever the step); each session opens with the fake page 'session_start', so a session without tracked pages is just 'session_start'. Sessions in chronological order (session id), pages in their in-session order — ⚠️ only on rows written after the 2026-10-13 deploy (insertDateTime >= '2026-10-14', jetcost-bi 0c72d87d): older rows, i.e. almost all the history, have the sessions in arbitrary order, so has(pagesNameList, 'x') is fine everywhere but positional reads (pagesNameList[n]) and page sequences are not.
+      # --- First session date ---
+      - column_name: firstSessionDate
+      # --- Temporal dimensions ---
+      - column_name: date
+      - column_name: year
+      - column_name: quarter
+      - column_name: yearQuarter
+      - column_name: month
+      - column_name: yearMonth
+      - column_name: week
+      - column_name: yearWeek
+      # --- Geographic & market ---
+      - column_name: country
+      - column_name: macroArea
+      - column_name: businessView
+      - column_name: region
+      - column_name: language
+      - column_name: website
+      - column_name: websiteType
+      - column_name: businessProfile
+      # --- Device & platform ---
+      - column_name: context
+      - column_name: device
+      - column_name: deviceType
+      - column_name: platform
+      # --- Attribution (last-click-not-direct) ---
+      - column_name: lastClickNotDirectCampaignPaidVsNotPaid
+      - column_name: lastClickNotDirectCampaignSource
+      - column_name: lastClickNotDirectCampaignMedium
+      - column_name: lastClickNotDirectCampaignChannelGroup
+      # --- Attribution (first session — campaign channel) ---
+      - column_name: firstSessionSessionCampaignPaidVsNotPaid
+      - column_name: firstSessionSessionCampaignSource
+      - column_name: firstSessionSessionCampaignMedium
+      - column_name: firstSessionSessionCampaignChannelGroup
+      # --- Attribution (first session — content channel) ---
+      - column_name: firstSessionSessionContentPaidVsNotPaid
+      - column_name: firstSessionSessionContentSource
+      - column_name: firstSessionSessionContentMedium
+      - column_name: firstSessionSessionContentChannelGroup
+      # --- User-level rank/cumulative ---
+      # These characterise the USER at the point in time captured by the row.
+      # They follow the same semantics as in other datamarts:
+      # *RankPerUser = N-th occurrence of that event in the user's lifetime.
+      # *CumulativePerUser = total accumulated value across the user's lifetime.
+      # Typical use: segment users by lifecycle stage, e.g.:
+      #   WHERE userSessionRankPerUser = 1 → first-ever session users only
+      - column_name: userSessionRankPerUser          # N-th session for this user (lifetime)
+      - column_name: userSearchRankPerUser           # N-th search (any product) for this user (lifetime)
+      - column_name: userSearchFlightRankPerUser     # N-th flight search for this user (lifetime)
+      - column_name: userSearchCarRankPerUser        # N-th car search for this user (lifetime)
+      - column_name: userSearchDpRankPerUser         # N-th dynamic-package search for this user (lifetime)
+      - column_name: userClickRankPerUser            # N-th click (any type) for this user (lifetime)
+      - column_name: userClickCoreRankPerUser        # lifetime Core (clickCategory 1001) clicks for this user
+      - column_name: userClickNotCoreRankPerUser     # lifetime clicks of ONE non-Core clickCategory for this user — NOT their total non-Core clicks (see FAMILY-SCOPED COLUMNS)
+      - column_name: userRevenueCumulativePerUser    # cumulative total revenue for this user (lifetime)
+      - column_name: userRevenueCoreCumulativePerUser   # cumulative core revenue for this user (lifetime)
+      - column_name: userRevenueNotCoreCumulativePerUser  # cumulative revenue of ONE non-Core clickCategory for this user (lifetime) — not of all their non-Core clicks
+      - column_name: userConversionRankPerUser          # N-th conversion (booking) for this user (lifetime)
+      - column_name: userCommissionValueCalculatedCumulativePerUser  # cumulative calculated commission for this user (lifetime)

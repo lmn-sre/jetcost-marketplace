@@ -1,0 +1,196 @@
+segments:
+  # ═══════════════════════════════════════════════════════════════════
+  # TRAFFIC SOURCE SEGMENTS
+  # ═══════════════════════════════════════════════════════════════════
+
+  - name: organic
+    label: Organic Traffic
+    description: Sessions from organic search (ignoring attribution model)
+    condition: "sessionCampaignChannelGroup = 'organic-search'"
+    applies_to: [sessions, searches, clicks]
+
+  - name: paid
+    label: Paid Traffic
+    description: Sessions from paid channels (ignoring attribution model)
+    condition: "sessionCampaignPaidVsNotPaid = 'paid'"
+    applies_to: [sessions, searches, clicks]
+    notes: >
+      This segment scopes the paid cohort on session-level campaign. A
+      lastclicknotdirect-scoped cohort (lastClickNotDirectCampaignPaidVsNotPaid)
+      is a wider, equally legitimate set — it recovers direct sessions that roll
+      back to an earlier paid touch. Both share the SAME cost denominator, so
+      they are two revenue perimeters over one spend figure, not two rival
+      definitions. `paid-search` (lastClickNotDirectCampaignChannelGroup =
+      'paid-search') is the SEM channel read used by agents/daily-report, not a
+      synonym for paid. See data/attribution.md.
+
+  - name: direct
+    label: Direct Traffic
+    description: Sessions from direct access
+    condition: "sessionCampaignChannelGroup = 'direct'"
+    applies_to: [sessions, searches, clicks]
+
+  - name: self_mal_inbound
+    label: Self MAL Inbound (self exit-unit)
+    description: >
+      Sessions Jetcost buys from MAL placements under its own 'mal' campaigns;
+      today that is the self trailing tab on the white labels' exit unit
+    condition: "sessionCampaignSource = 'mal'"
+    applies_to: [sessions, searches, clicks, impressions]
+    notes: >
+      sessionCampaignChannelGroup = 'checkbox' is NOT this segment. The channel
+      group is the generic "acquired from a MAL-style placement" bucket and
+      also holds genuine third-party inbound (bookingbuddy, mediaalpha,
+      farecompare, turismocity, ...): real external spend, whereas the self
+      trailing tab is an internal transfer. Non-'mal' share of the channel group
+      (qualified, jetcost): 24% in 2023, 23% in 2024, 13% in 2025, 0.1% in
+      2026. Every 'mal' session is in that channel group, so the source alone
+      is the condition.
+      The unit behind it changed over time (read it off sessionCampaign):
+      *_mal_f_c_jc_trailingtab_* starts on 2025-07-16 and is 99.7% of 2026;
+      before it the campaigns are *_mal_f_c_jc_exitunit-form_* (~55%) and
+      *_mal_f_c_jc_checkboxes_* (~45%). The checkboxes are a different unit:
+      on a window before 2026, exclude sessionCampaign ILIKE '%_checkboxes_%'
+      to keep the exit unit only. Whether exitunit-form is the same placement
+      under its older campaign name is not established — say so rather than
+      treating it as the trailing tab.
+      See core/commercials/mal/self-trailingtab.md in the domain bundle.
+
+  - name: come_back_to_jetcost
+    label: Come Back to Jetcost (CB2J)
+    description: >
+      Sessions the userbased model credits to a returning relationship — the
+      perimeter of CB2J revenue, the metric of initiative INIT-955
+    condition: |
+      (userBasedCluster = '02. Returning Paid' AND userBasedCampaignCampaignType IN ('brand', 'branded'))
+      OR userBasedCluster IN ('03. Marketing-Driven', '05. Returning Notpaid')
+    applies_to: [sessions]
+    notes: >
+      No 'hybrid' (the old name of branded) in userBasedCampaignCampaignType
+      since 2025-10-01; add it to the IN list before reading an earlier window.
+      The INIT-955 target is set on CPA-dominant markets only: add
+      country NOT IN ('US', 'CA', 'UK', 'AU') to compare against it.
+      See core/business/initiatives.md (INIT-955) in the domain bundle.
+
+  # ═══════════════════════════════════════════════════════════════════
+  # SEARCH BEHAVIOR SEGMENTS
+  # ═══════════════════════════════════════════════════════════════════
+
+  - name: searches_with_filters
+    label: Searches with Filters Applied
+    description: Searches where users actively used frontend filters
+    condition: "filterChanges >= 1"
+    applies_to: [searches, clicks]
+    inverse:
+      name: searches_without_filters
+      condition: "filterChanges < 1 OR filterChanges IS NULL"
+
+  - name: ow_searches
+    label: One-Way Searches
+    description: Searches for one-way flights
+    condition: "searchType = 'OW'"
+    applies_to: [searches, clicks]
+
+  - name: rt_searches
+    label: Round-Trip Searches
+    description: Searches for round-trip flights
+    condition: "searchType = 'RT'"
+    applies_to: [searches, clicks]
+
+  # ═══════════════════════════════════════════════════════════════════
+  # CLICK TYPE SEGMENTS
+  # ═══════════════════════════════════════════════════════════════════
+
+  - name: vi_clicks
+    label: Virtual Interlining Clicks
+    description: Clicks performed on VI (Virtual Interlining) offers
+    condition: "isVi = 1"
+    applies_to: [clicks]
+    available_from:
+      web: "2025-06-17"
+      app: "2025-10-02"
+    inverse:
+      name: not_vi_clicks
+      condition: "isVi = 0 OR isVi IS NULL"
+
+  - name: self_transfer_clicks
+    label: Self Transfer Clicks
+    description: Clicks/impressions on Self Transfer (Virtual Interlining) offers
+    condition: "isSelfTransfer = 1"
+    applies_to: [clicks, impressions]
+    available_from:
+      web: "2026-06-25"
+    inverse:
+      name: not_self_transfer_clicks
+      condition: "isSelfTransfer = 0 OR isSelfTransfer IS NULL"
+
+  - name: core_clicks
+    label: Core Clicks
+    description: Primary clickouts (category 1001)
+    condition: "clickCategory = 1001"
+    applies_to: [clicks]
+
+  - name: cpc_clicks
+    label: CPC Clicks
+    description: Clicks with CPC business model
+    condition: "businessModel IS NULL OR businessModel = 'cpc'"
+    applies_to: [clicks]
+
+  - name: cpa_clicks
+    label: CPA Clicks
+    description: Clicks with CPA business model (includes cpa, cpa%, rs)
+    condition: "businessModel NOT IN ('cpc')"
+    applies_to: [clicks]
+
+  # ═══════════════════════════════════════════════════════════════════
+  # DEVICE SEGMENTS (WEB ONLY)
+  # ═══════════════════════════════════════════════════════════════════
+
+  - name: desktop
+    label: Desktop Traffic
+    description: Web sessions from desktop devices
+    condition: "device IN ('desktop', 'tablet')"
+    applies_to: [sessions, searches, clicks]
+    context: web
+
+  - name: mobile
+    label: Mobile Traffic
+    description: Web sessions from mobile devices (phone + tablet)
+    condition: "device IN ('phone', 'mobile')"
+    applies_to: [sessions, searches, clicks]
+    context: web
+
+  # ═══════════════════════════════════════════════════════════════════
+  # PRODUCT SEGMENTS
+  # ═══════════════════════════════════════════════════════════════════
+
+  - name: flight_product
+    label: Flight Product
+    description: Searches/clicks for flight product
+    condition: "product = 'FLIGHT'"
+    applies_to: [searches, clicks]
+
+  - name: cars_product
+    label: Cars Product
+    description: Searches/clicks for car rental product
+    condition: "product = 'CARS'"
+    applies_to: [searches, clicks]
+
+  - name: dp_product
+    label: Dynamic Package Product
+    description: Searches/clicks for dynamic package product
+    condition: "product = 'DP'"
+    applies_to: [searches, clicks]
+
+  # ═══════════════════════════════════════════════════════════════════
+  # MARKET SEGMENTS
+  # ═══════════════════════════════════════════════════════════════════
+
+  - name: web_detail_page_markets
+    label: Markets with Detail Page - Web only
+    description: Markets where detail page is available - Web only
+    condition: |
+      country NOT IN ('US', 'CA', 'UK')
+    applies_to: [sessions, searches, clicks]
+    context: web
+    notes: Configuration-based segment - check backoffice for latest profile https://admin3.jetcost.com/resources/features-features/43

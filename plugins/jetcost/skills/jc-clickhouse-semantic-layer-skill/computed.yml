@@ -1,0 +1,737 @@
+dimensions:
+  - name: route
+    source: [searches, clicks, impressions]
+    expression: "CONCAT(iataFrom, '-', iataTo)"
+    description: "Origin-destination route code (e.g., MXP-BCN, FCO-JFK)"
+
+  - name: Route - IATA
+    source: [searches, clicks, impressions]
+    expression: "CONCAT(iataFrom, '-', iataTo)"
+    description: "Origin-destination route code (e.g., MXP-BCN, FCO-JFK)"
+
+  # --- Trip & Booking clusters ---
+  - name: tripDurationClustered
+    source: [searches, clicks, impressions]
+    expression: "multiIf( product = 'FLIGHT', if( isAr = 1, multiIf( tripDuration <= 1, '01. 0-1', tripDuration <= 3, '02. 2-3', tripDuration <= 7, '03. 4-7', tripDuration <= 14, '04. 8-14', '05. 15+' ), 'Not AR' ), product = 'CAR', multiIf( (dropoffDate-pickupDate) <= 1, '01. 0-1', (dropoffDate-pickupDate) <= 3, '02. 2-3', (dropoffDate-pickupDate) <= 7, '03. 4-7', (dropoffDate-pickupDate) <= 14, '04. 8-14', '05. 15+' ), product = 'DP', multiIf( (backDate - goDate) = 0, '01. 0', (backDate - goDate) <= 7, '02. 1-7', (backDate - goDate) <= 21, '03. 8-21', (backDate - goDate) <= 60, '04. 22-60', '05. 61+' ), NULL )"
+    description: "Trip duration clustered. Same buckets for all products: 0-1, 2-3, 4-7, 8-14, 15+. One-way flights show 'Not AR'."
+
+  # Sessions has its own booking window, on the first flight search of the user's
+  # first session. NOT a physical column: defined at runtime in Superset, like the
+  # clustered dimensions above. Flight only by construction — the source search
+  # always comes from raw_jc.flys_search — so it needs no product branch, unlike
+  # the searches/clicks/impressions one below. Buckets are the product's own, from
+  # raw_jc.common_common_booking_windows (the same ones the feature-flag rules use).
+  #
+  # ⚠️ NEVER NULL. The NULL case is folded into '00. bookingWindow Not Available',
+  #    so `IS NOT NULL` filters nothing — exclude the '00' bucket by label instead.
+  # ⚠️ '00' HOLDS EVERY SESSION DATED BEFORE 2025-01-01, the sessions floor of
+  #    firstSessionFirstFlightSearchBookingWindow (see attributes.yml): before it
+  #    the column is NULL on every row, so the distribution is 100% '00'. Never
+  #    read it across that date. In ARPU or retention, floor the COHORT, not the
+  #    dates — firstSessionDate >= '2025-01-01' — or the users installed before
+  #    the floor bring revenue without installs (attributes.yml has the numbers).
+  # ⚠️ From the floor on, '00' means "the user's first session had no flight
+  #    search", and it still DOMINATES: 84.8% of all sessions on 2026-10-11
+  #    (598,190 of 705,742, no R002 filter). It tracks the new/returning mix, not
+  #    booking behaviour: that day 87.5% of sessions were first sessions, and 8%
+  #    of those ran a flight search against 65% of returning ones — on 2026-09-16,
+  #    with fewer first sessions, '00' was 78.6%. Exclude it before reading the
+  #    distribution, and do not read a move in its share as a behaviour change.
+  # ⚠️ '01. 0-3' also collects the NEGATIVE booking windows (dirty goDate, min -1)
+  #    — 187 sessions on 2026-10-11, 0.2% of those with a value — because the
+  #    first branch is `<= 3`.
+  - name: firstSessionFirstFlightSearchBookingWindowClustered
+    source: [sessions]
+    expression: "multiIf(firstSessionFirstFlightSearchBookingWindow is null, '00. bookingWindow Not Available', firstSessionFirstFlightSearchBookingWindow <= 3, '01. 0-3', firstSessionFirstFlightSearchBookingWindow <= 7, '02. 4-7', firstSessionFirstFlightSearchBookingWindow <= 21, '03. 8-21', firstSessionFirstFlightSearchBookingWindow <= 45, '04. 22-45', firstSessionFirstFlightSearchBookingWindow <= 90, '05. 46-90', '06. 91+')"
+    description: "Booking window of the first flight search of the user's first session, bucketed like the product's own booking windows: 0-3, 4-7, 8-21, 22-45, 46-90, 91+. Flight only, sessions only. Never NULL — missing values land in '00. bookingWindow Not Available', which also holds every session dated before 2025-01-01 (the column's sessions floor). See the comment above before slicing by it, and floor the cohort in ARPU or retention."
+
+  # ⚠️ The '00. bookingWindow Not Available' bucket exists ONLY in the FLIGHT branch,
+  #    and it is a CLICKS phenomenon: on 2026-09-16 it is 61,395 of 112,694 FLIGHT
+  #    clicks (54.5%), against 0 in searches and 0 in impressions. It is almost
+  #    exactly clickCategory = 4002 — clicks with no search behind them, e.g. MAL
+  #    trailing tab — which that day was 60,942 clicks, all of them with a NULL
+  #    bookingWindow AND a NULL iataFrom. On core clicks (clickCategory = 1001) it
+  #    drops to 437 of 44,493 (1%). So a click-side booking window distribution that
+  #    is half "Not Available" is CORRECT, not broken: filter clickCategory = 1001,
+  #    or exclude the '00' label, before reading it.
+  # ⚠️ CAR and DP have NO '00' bucket. A NULL in those branches falls through every
+  #    condition and silently lands in the LAST bucket ('05. 31+' for CAR, '05. 61+'
+  #    for DP) instead of being flagged. CAR is safe in practice — it reads
+  #    (pickupDate - date), and pickupDate is never NULL — but do not assume the
+  #    same if the expression is ever reused elsewhere.
+  # ⚠️ Products other than FLIGHT/CAR/DP return NULL, so this one IS nullable,
+  #    unlike its sessions sibling above.
+  - name: bookingWindowClustered
+    source: [searches, clicks, impressions]
+    expression: "multiIf( product = 'FLIGHT', multiIf( bookingWindow is null, '00. bookingWindow Not Available', bookingWindow <= 3, '01. 0-3', bookingWindow <= 7, '02. 4-7', bookingWindow <= 21, '03. 8-21', bookingWindow <= 45, '04. 22-45', bookingWindow <= 90, '05. 46-90', '06. 91+' ), product = 'CAR', multiIf( (pickupDate-date) = 0, '01. 0', (pickupDate-date) <= 3, '02. 1-3', (pickupDate-date) <= 7, '03. 4-7', (pickupDate-date) <= 30, '04. 8-30', '05. 31+' ), product = 'DP', multiIf( bookingWindow = 0, '01. 0', bookingWindow <= 7, '02. 1-7', bookingWindow <= 21, '03. 8-21', bookingWindow <= 60, '04. 22-60', '05. 61+' ), NULL )"
+    description: "Booking window clustered by product. FLIGHT: 0-3, 4-7, 8-21, 22-45, 46-90, 91+, plus '00. bookingWindow Not Available'. CAR: 0, 1-3, 4-7, 8-30, 31+ (from pickupDate - date). DP: 0, 1-7, 8-21, 22-60, 61+. See the comment above: the '00' bucket is a clicks phenomenon and dominates there."
+
+  # --- Airline type classification (LCC / FSC / Mix) ---
+  - name: Airlines - Type
+    source: [clicks, impressions]
+    expression: "if( CONCAT(inboundAirlines, outboundAirlines) != '' AND CONCAT(inboundAirlines, outboundAirlines) IS NOT NULL, multiIf( length(arrayDistinct(arrayMap(x -> dictGet('config.dict_carriers', 'isLcc', tuple(x)), splitByString(',', assumeNotNull(CONCAT(inboundAirlines, outboundAirlines)))))) > 1,'LC+FS', arrayDistinct(arrayMap(x -> dictGet('config.dict_carriers', 'isLcc', tuple(x)), splitByString(',', assumeNotNull(CONCAT(inboundAirlines, outboundAirlines)))))[1] = 1, 'LCC', arrayDistinct(arrayMap(x -> dictGet('config.dict_carriers', 'isLcc', tuple(x)), splitByString(',', assumeNotNull(CONCAT(inboundAirlines, outboundAirlines)))))[1] = 0, 'FSC', 'Other' ), NULL )"
+    description: "Airline type across both legs. Values: FSC (full service), LCC (low cost), LC+FS (both)."
+
+  - name: Inbound Airlines - Type
+    source: [clicks, impressions]
+    expression: "if( inboundAirlines != '' AND inboundAirlines IS NOT NULL, multiIf( length(arrayDistinct(arrayMap(x -> dictGet('config.dict_carriers', 'isLcc', tuple(x)), splitByString(',', assumeNotNull(inboundAirlines))))) > 1,'LC+FS', arrayDistinct(arrayMap(x -> dictGet('config.dict_carriers', 'isLcc', tuple(x)), splitByString(',', assumeNotNull(inboundAirlines))))[1] = 1, 'LCC', arrayDistinct(arrayMap(x -> dictGet('config.dict_carriers', 'isLcc', tuple(x)), splitByString(',', assumeNotNull(inboundAirlines))))[1] = 0, 'FSC', 'Other' ), NULL )"
+    description: "Inbound leg airline type. Values: FSC, LCC, LC+FS."
+
+  - name: Outbound Airlines - Type
+    source: [clicks, impressions]
+    expression: "if( outboundAirlines != '' AND outboundAirlines IS NOT NULL, multiIf( length(arrayDistinct(arrayMap(x -> dictGet('config.dict_carriers', 'isLcc', tuple(x)), splitByString(',', assumeNotNull(outboundAirlines))))) > 1,'LC+FS', arrayDistinct(arrayMap(x -> dictGet('config.dict_carriers', 'isLcc', tuple(x)), splitByString(',', assumeNotNull(outboundAirlines))))[1] = 1, 'LCC', arrayDistinct(arrayMap(x -> dictGet('config.dict_carriers', 'isLcc', tuple(x)), splitByString(',', assumeNotNull(outboundAirlines))))[1] = 0, 'FSC', 'Other' ), NULL )"
+    description: "Outbound leg airline type. Values: FSC, LCC, LC+FS."
+
+  - name: Company Go - Is LCC
+    source: [clicks]
+    expression: "if(companyGo != '' AND companyGo IS NOT NULL, dictGet('config.dict_carriers', 'isLcc', tuple(companyGo)), NULL)"
+    description: "True if outbound operating carrier is Low Cost."
+
+  - name: Company Back - Is LCC
+    source: [clicks]
+    expression: "if(companyBack != '' AND companyBack IS NOT NULL, dictGet('config.dict_carriers', 'isLcc', tuple(companyBack)), NULL)"
+    description: "True if inbound operating carrier is Low Cost."
+
+  - name: Airline Go - Name
+    source: [clicks]
+    expression: "dictGet('config.dict_carriers', 'name', tuple(companyGo))"
+    description: "Outbound operating carrier name."
+
+  - name: Airline Back - Name
+    source: [clicks]
+    expression: "dictGet('config.dict_carriers', 'name', tuple(companyBack))"
+    description: "Inbound operating carrier name."
+
+  - name: Airlines Route
+    source: [clicks, impressions]
+    expression: "CONCAT(outboundAirlines, if(inboundAirlines != '', CONCAT('-', inboundAirlines), ''))"
+    description: "Combined airline codes for outbound and inbound legs (e.g., 'FR-FR', 'FR,U2-FR')."
+
+  # --- Click category & invoicing ---
+  - name: Click Category - Description
+    source: [clicks]
+    expression: "dictGet('config.dict_click_category', 'clickCategoryDescription', tuple(clickCategory))"
+    description: "Human-readable click category. Values: 1001 Regular Clickout Core, 2003 MAL Checkbox, 3003 MAL Promobox, 3006 MAL Inline, 4002 MAL Exit Unit, etc."
+
+  - name: Click Category - Macro Type
+    source: [clicks]
+    expression: "dictGet('config.dict_click_category', 'clickCategoryMacroType', tuple(clickCategory))"
+    description: "Macro classification of click category. Values: Core, Mal Core, Mal Media."
+
+  - name: Click Invoicing Key
+    source: [clicks]
+    expression: "CONCAT( if( partner NOT LIKE '%APP' AND deviceType = 'app', CONCAT(partner, '_APP'), partner ), '-', if(country = '', 'ZZ', country), '-', if(product = '', 'FLIGHT', product), if( partner LIKE '%APP' OR deviceType = 'app', '', CONCAT('-',UPPER(deviceType)) ) )"
+    description: "Composite invoicing key: partner-country-product[-device]. APP partners don't get device suffix."
+
+  - name: Commission Model
+    source: [clicks]
+    expression: "if(businessModel IS NOT NULL, businessModel, ruleBusinessModel)"
+    description: "Commission model associated with the click. Not a column: query the expression, never commissionModel. Values: cpc, cpa, cpa%, rs, cpa_min_cpc, cpa%_min_cpc, bid (MAL external networks, since 2026-01-01), amc3 (until 2024-07-09), blank (MAL before 2026-01-01). Falls back to ruleBusinessModel if businessModel is null, i.e. on every click before 2024-06-12."
+
+  - name: Group Conversion Availability
+    source: [clicks]
+    expression: "if(groupConversionsAvailableSinceDate is null, toBool(0), toBool(date>=groupConversionsAvailableSinceDate))"
+    description: "True if conversion ingestion (via Partners-Hub) for the partner group is available on the given date."
+
+  - name: businessModel - Macro Type
+    source: [clicks]
+    expression: "multiIf(businessModel is null, null, businessModel = 'cpc', 'cpc', 'cpa')"
+    description: "Clusterization of commission model associated with the click. Values: cpc, cpa. Falls back to null if businessModel is null."
+
+  # --- Price ---
+  - name: Total Price Cluster - Eur
+    source: [clicks]
+    expression: "multiIf( clickCategory != 1001, 'Not Core', totalPrice*euroExchangeRate<101, '01. 0-100', totalPrice*euroExchangeRate>=101 and totalPrice*euroExchangeRate<300, '02. 101-300', totalPrice*euroExchangeRate>=301 and totalPrice*euroExchangeRate<600, '03. 301-600', totalPrice*euroExchangeRate>=601 and totalPrice*euroExchangeRate<1000, '04. 601-1000', '05. 1000+' )"
+    description: "Total price in EUR bucketed. Only for Core clicks (clickCategory=1001), others show 'Not Core'. Buckets: 0-100, 101-300, 301-600, 601-1000, 1000+."
+
+  - name: Hero Total Price Cluster - Eur
+    source: [impressions]
+    expression: "multiIf( impressionType NOT IN ('itinerary_core', 'itinerary_cug'), 'Not Core', heroTotalPrice*euroExchangeRate<101, '01. 0-100', heroTotalPrice*euroExchangeRate>=101 and heroTotalPrice*euroExchangeRate<300, '02. 101-300', heroTotalPrice*euroExchangeRate>=301 and heroTotalPrice*euroExchangeRate<600, '03. 301-600', heroTotalPrice*euroExchangeRate>=601 and heroTotalPrice*euroExchangeRate<1000, '04. 601-1000', '05. 1000+' )"
+    description: "Hero total price in EUR bucketed. Only for Core/CUG impressions (itinerary_core, itinerary_cug), others show 'Not Core'. Buckets: 0-100, 101-300, 301-600, 601-1000, 1000+."
+
+  # --- Geography ---
+  - name: Country - Is Local
+    source: [sessions, searches, clicks, impressions]
+    expression: "toBool(if(countryUser = country, 1, 0))"
+    description: >
+      True if the user's geo-IP country matches the market country. Both fields are
+      in the market/user code space, so they compare directly — including the UK,
+      where both use 'UK'. No GB normalisation is needed here (see R015): that is
+      only required when comparing against a route field such as countryFrom.
+
+  - name: Country Route
+    source: [searches, clicks, impressions]
+    expression: "CONCAT(countryFrom, '-', countryTo)"
+    description: "Route at country level (countryFrom-countryTo, e.g., 'FR-ES')."
+
+  - name: Route - Parent IATA
+    source: [searches, clicks, impressions]
+    expression: "CONCAT(iataFromParent,'-', iataToParent)"
+    description: "Route at parent/city IATA level (e.g., 'PAR-LON' instead of 'CDG-LHR')."
+
+  - name: Sub-Continent - From
+    source: [searches, clicks]
+    expression: "dictGet('config.dict_geo_country_region', 'subRegion', tuple(ifNull(countryFrom, '')))"
+    description: "Sub-region of departure country (e.g., Western Europe, Northern Africa, Northern America)."
+
+  - name: Sub-Continent - To
+    source: [searches, clicks]
+    expression: "dictGet('config.dict_geo_country_region', 'subRegion', tuple(ifNull(countryTo, '')))"
+    description: "Sub-region of arrival country (e.g., Western Europe, Northern Africa, Northern America)."
+
+  - name: isSameLocationCustom
+    source: [clicks]
+    expression: "toBool(if(pickupIata = dropoffIata, 1, 0))"
+    description: "For car rentals: true if pickup and dropoff locations are the same IATA."
+
+  # --- Time dimensions ---
+  - name: Week Monday
+    source: [sessions, searches, clicks]
+    expression: "dictGet('config.dict_week', 'weekMonday', tuple(date))"
+    description: "Week number considering Monday as first day of the week."
+
+  - name: Year Week Monday
+    source: [sessions, searches, clicks]
+    expression: "dictGet('config.dict_week', 'yearWeekMonday', tuple(date))"
+    description: "Year and week as UInt32 YYYYWW, Monday-based (the ISO week, e.g., 202609)."
+
+  # --- Page position ---
+  - name: cardPosition - Number
+    source: [clicks]
+    expression: "toInt32(cardPosition)"
+    description: "Position of the offer in the itinerary, cast to integer for sorting/aggregation."
+
+  - name: pagePosition - Number
+    source: [clicks]
+    expression: "toInt32(pagePosition)"
+    description: "Position of the itinerary, cast to integer for sorting/aggregation."
+
+  - name: landingPage
+    source: [sessions, searches, clicks, impressions]
+    expression: "pagesName[1]"
+    description: "First page of the session (landing page)"
+    context: web
+
+  - name: pageName - First
+    source: [sessions, searches, clicks, impressions]
+    expression: "pagesName[1]"
+    description: "First page of the session (landing page). Alias of landingPage."
+    context: web
+
+  - name: pageName - Second
+    source: [sessions, searches, clicks, impressions]
+    expression: "pagesName[2]"
+    description: "Second page visited in the session."
+
+  # --- Google Ads bidding strategy lookups (3 attribution models x 3 fields) ---
+  - name: userBasedCampaignAccessibleBiddingStrategyId
+    source: [sessions, searches, clicks, impressions]
+    expression: "dictGet('config.dict_meta_performance_marketing_campaigns', 'accessibleBiddingStrategyId', tuple(date, device, assumeNotNull(userBasedCampaign)))"                 
+    description: "Google Ads or SA360 bidding strategy ID (account-owned and cross-account) for user-based campaign attribution."
+
+  - name: userBasedCampaignAccessibleBiddingStrategyName
+    source: [sessions, searches, clicks, impressions]
+    expression: "dictGet('config.dict_meta_performance_marketing_campaigns', 'accessibleBiddingStrategyName', tuple(date, device, assumeNotNull(userBasedCampaign)))"
+    description: "Google Ads or SA360 bidding strategy name for user-based campaign attribution."
+
+  - name: userBasedCampaignAccessibleBiddingStrategyType
+    source: [sessions, searches, clicks, impressions]
+    expression: "dictGet('config.dict_meta_performance_marketing_campaigns', 'accessibleBiddingStrategyType', tuple(date, device, assumeNotNull(userBasedCampaign)))"
+    description: "Google Ads or SA360 bidding strategy type for user-based campaign attribution."
+
+  - name: lastClickNotDirectCampaignAccessibleBiddingStrategyId
+    source: [sessions, searches, clicks, impressions]
+    expression: "dictGet('config.dict_meta_performance_marketing_campaigns', 'accessibleBiddingStrategyId', tuple(date, device, assumeNotNull(lastClickNotDirectCampaign)))"
+    description: "Google Ads or SA360 bidding strategy ID for last-click-not-direct campaign attribution."
+
+  - name: lastClickNotDirectCampaignAccessibleBiddingStrategyName
+    source: [sessions, searches, clicks, impressions]
+    expression: "dictGet('config.dict_meta_performance_marketing_campaigns', 'accessibleBiddingStrategyName', tuple(date, device, assumeNotNull(lastClickNotDirectCampaign)))"
+    description: "Google Ads or SA360 bidding strategy name for last-click-not-direct campaign attribution."
+
+  - name: lastClickNotDirectCampaignAccessibleBiddingStrategyType
+    source: [sessions, searches, clicks, impressions]
+    expression: "dictGet('config.dict_meta_performance_marketing_campaigns', 'accessibleBiddingStrategyType', tuple(date, device, assumeNotNull(lastClickNotDirectCampaign)))"
+    description: "Google Ads or SA360 bidding strategy type for last-click-not-direct campaign attribution."
+
+  - name: sessionCampaignAccessibleBiddingStrategyId
+    source: [sessions, searches, clicks, impressions]
+    expression: "dictGet('config.dict_meta_performance_marketing_campaigns', 'accessibleBiddingStrategyId', tuple(date, device, assumeNotNull(sessionCampaign)))"
+    description: "Google Ads or SA360 bidding strategy ID for session-level campaign attribution."
+
+  - name: sessionCampaignAccessibleBiddingStrategyName
+    source: [sessions, searches, clicks, impressions]
+    expression: "dictGet('config.dict_meta_performance_marketing_campaigns', 'accessibleBiddingStrategyName', tuple(date, device, assumeNotNull(sessionCampaign)))"
+    description: "Google Ads or SA360 bidding strategy name for session-level campaign attribution."
+
+  - name: sessionCampaignAccessibleBiddingStrategyType
+    source: [sessions, searches, clicks, impressions]
+    expression: "dictGet('config.dict_meta_performance_marketing_campaigns', 'accessibleBiddingStrategyType', tuple(date, device, assumeNotNull(sessionCampaign)))"
+    description: "Google Ads or SA360 bidding strategy type for session-level campaign attribution."
+
+  # --- Traffic Control (attr 1254, since 2026-06-09) ---
+  # trafficControlMap is Map(String, Tuple(Int8 inControl, String scope, UInt8 pct)),
+  # one key per traffic-control code the session was subject to. Read any code as:
+  #   inControl: toBool(trafficControlMap['<CODE>'].1)  -- true = control group (product behaviour withheld)
+  #   scope:     trafficControlMap['<CODE>'].2
+  #   pct:       trafficControlMap['<CODE>'].3          -- share of traffic put in control
+  # A missing key (mapContains(trafficControlMap, '<CODE>') = 0) means the session
+  # was not subject to that code: it is neither control nor treated, so filter on
+  # mapContains before comparing inControl true vs false. Never hardcode a list of
+  # codes: list them from the data (arrayJoin(mapKeys(trafficControlMap))).
+  # Traffic controls are independent of A/B tests: a session can carry both
+  # a code here and an abTestId.
+
+metrics:
+  - name: ARPU
+    source: [sessions]
+    expression: if(sumIf(sessions, isFirstSession) = 0, 0, ROUND(SUM(revenueCurrentProRataTotal) / sumIf(sessions, isFirstSession), 4))
+  - name: CR Core
+    source: [sessions]
+    expression: if(SUM(clicksCore) = 0, 0 , ROUND(SUM(conversions)/SUM(clicksCore),4))
+  - name: CR Core Car
+    source: [sessions]
+    expression: if(SUM(clicksCoreCar) = 0, 0 , ROUND(SUM(conversionsCar)/SUM(clicksCoreCar),4))
+  - name: CR Core Flight
+    source: [sessions]
+    expression: if(SUM(clicksCoreFlight) = 0, 0 , ROUND(SUM(conversionsFlight)/SUM(clicksCoreFlight),4))
+  - name: CTR Core
+    source: [sessions]
+    expression: if(SUM(searches) = 0, 0, ROUND(SUM(clicksCore)/ SUM(searches),4))
+  - name: CTR Core Car
+    source: [sessions]
+    expression: if(SUM(searchesCar) = 0, 0, ROUND(SUM(clicksCoreCar)/ SUM(searchesCar),4))
+  - name: CTR Core Flight
+    source: [sessions]
+    expression: if(SUM(searchesFlight) = 0, 0, ROUND(SUM(clicksCoreFlight)/ SUM(searchesFlight),4))
+  - name: First Sessions
+    source: [sessions]
+    expression: sumIf(sessions, isFirstSession)
+  - name: First Sessions - App Openings
+    source: [sessions]
+    expression: sumIf(sessions, isFirstAppOpening)
+  - name: LTB
+    source: [sessions, searches]
+    expression: if(SUM(conversions) = 0, 0, ROUND(SUM(conversions)/SUM(searches),4))
+  - name: LTB Car
+    source: [sessions]
+    expression: if(SUM(conversionsCar) = 0, 0, ROUND(SUM(conversionsCar)/SUM(searchesCar),4))
+  - name: LTB Flight
+    source: [sessions]
+    expression: if(SUM(conversionsFlight) = 0, 0, ROUND(SUM(conversionsFlight)/SUM(searchesFlight),4))
+  # ROAS Pro Rata family: pro-rata revenue over marketing cost, declined on the
+  # three core bases (revenueCurrentCore / revenueEcpcCore / revenueOperationalCore)
+  # and on ALL SIX userBasedCluster segments. Numerator = core + ProRataMal +
+  # ProRataNetMedia + ProRataDataMonetization; denominator = costProRataMktg, which
+  # is NOT filtered by cluster, so each member is that cluster's share of the overall
+  # ROAS and the six sum back to it. Each member is rounded on its own, so a residual
+  # of a few hundredths against the overall is rounding, not a missing segment.
+  # '99. Unconsented' is app-only, so its member is exactly 0 on a web-only slice —
+  # correct, not a gap. It also holds the 'Unidentified' W2A sessions (from
+  # 2026-09-02). See attributes.yml for what the value is.
+  # The seven "- revenueCurrentCore" members are ALIASES of the roasProRata metrics
+  # further down this file: same expression, kept under both names on purpose —
+  # roasProRata* mirrors the metric names an analyst sees in Superset, while these
+  # keep the three-core symmetry of the family. Change one, change the other.
+  # Numerator scope: the denominator (costProRataMktg) is the SAME whichever
+  # attribution model defines the cohort — all spend sits on session-level paid
+  # sessions, which are included either way. Only which sessions enter the
+  # numerator changes. There is no authoritative reading: state which model you
+  # are applying. See data/attribution.md.
+  # Do NOT break this family down by platform without checking what the app
+  # denominator holds: app sessions carry cost only for app-install campaigns
+  # (GAds from 2026-09-07, Apple Ads from 2026-10-26) and for OIA campaigns
+  # (Google Ads cost spread over web + app from the October 2026 restatement,
+  # history back to 2023-01). Every other app session, including the W2A ones of
+  # non-OIA campaigns, still reads 0 (revenue/0). See the marketing pro-rata
+  # block in attributes.yml.
+  - name: ROAS Pro Rata - revenueCurrentCore
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND(SUM(revenueCurrentProRataTotal) / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  - name: ROAS Pro Rata - revenueEcpcCore
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND((SUM(revenueEcpcCore) + ROUND(SUM(revenueCurrentProRataMal), 2) + ROUND(SUM(revenueCurrentProRataNetMedia), 2) + ROUND(SUM(revenueCurrentProRataDataMonetization), 2)) / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  - name: ROAS Pro Rata - revenueOperationalCore
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND((SUM(revenueOperationalCore) + ROUND(SUM(revenueCurrentProRataMal), 2) + ROUND(SUM(revenueCurrentProRataNetMedia), 2) + ROUND(SUM(revenueCurrentProRataDataMonetization), 2)) / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  # ROAS Pro Rata - Full Core: NOT a fourth core base like the three above — a
+  # narrower numerator on purpose. Core + MAL Core only, excluding Media
+  # (ProRataNetMedia) and Data Monetisation entirely. This is the revenue base
+  # Google Ads' own bid strategies can actually see: its conversion signals are
+  # Core Click Signals and MAL Core Click Signals only (see
+  # core/marketing/sem/google-ads.md's Conversion Signals), never Media or Data
+  # Monetisation. Use this to judge bid calibration; use the whole-business
+  # variants above for a volume/GP call — see core/marketing/sem/metrics.md's
+  # ROAS section. revenueCurrentProRataMalCore, not revenueCurrentMalCore: the
+  # latter is a direct column on searches/clicks, not on sessions, where this
+  # family lives — an easy field-name mix-up.
+  - name: ROAS Pro Rata - Full Core
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND((SUM(revenueCurrentCore) + ROUND(SUM(revenueCurrentProRataMalCore), 2)) / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  - name: ROAS Pro Rata 01. New Paid - revenueCurrentCore
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND(sumIf(revenueCurrentProRataTotal, userBasedCluster = '01. New Paid') / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  - name: ROAS Pro Rata 01. New Paid - revenueEcpcCore
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND((sumIf(revenueEcpcCore, userBasedCluster = '01. New Paid') + ROUND(sumIf(revenueCurrentProRataMal, userBasedCluster = '01. New Paid'), 2) + ROUND(sumIf(revenueCurrentProRataNetMedia, userBasedCluster = '01. New Paid'), 2) + ROUND(sumIf(revenueCurrentProRataDataMonetization, userBasedCluster = '01. New Paid'), 2)) / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  - name: ROAS Pro Rata 01. New Paid - revenueOperationalCore
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND((sumIf(revenueOperationalCore, userBasedCluster = '01. New Paid') + ROUND(sumIf(revenueCurrentProRataMal, userBasedCluster = '01. New Paid'), 2) + ROUND(sumIf(revenueCurrentProRataNetMedia, userBasedCluster = '01. New Paid'), 2) + ROUND(sumIf(revenueCurrentProRataDataMonetization, userBasedCluster = '01. New Paid'), 2)) / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  - name: ROAS Pro Rata 02. Returning Paid - revenueCurrentCore
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND(sumIf(revenueCurrentProRataTotal, userBasedCluster = '02. Returning Paid') / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  - name: ROAS Pro Rata 02. Returning Paid - revenueEcpcCore
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND((sumIf(revenueEcpcCore, userBasedCluster = '02. Returning Paid') + ROUND(sumIf(revenueCurrentProRataMal, userBasedCluster = '02. Returning Paid'), 2) + ROUND(sumIf(revenueCurrentProRataNetMedia, userBasedCluster = '02. Returning Paid'), 2) + ROUND(sumIf(revenueCurrentProRataDataMonetization, userBasedCluster = '02. Returning Paid'), 2)) / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  - name: ROAS Pro Rata 02. Returning Paid - revenueOperationalCore
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND((sumIf(revenueOperationalCore, userBasedCluster = '02. Returning Paid') + ROUND(sumIf(revenueCurrentProRataMal, userBasedCluster = '02. Returning Paid'), 2) + ROUND(sumIf(revenueCurrentProRataNetMedia, userBasedCluster = '02. Returning Paid'), 2) + ROUND(sumIf(revenueCurrentProRataDataMonetization, userBasedCluster = '02. Returning Paid'), 2)) / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  - name: ROAS Pro Rata 03. Marketing-Driven - revenueCurrentCore
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND(sumIf(revenueCurrentProRataTotal, userBasedCluster = '03. Marketing-Driven') / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  - name: ROAS Pro Rata 03. Marketing-Driven - revenueEcpcCore
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND((sumIf(revenueEcpcCore, userBasedCluster = '03. Marketing-Driven') + ROUND(sumIf(revenueCurrentProRataMal, userBasedCluster = '03. Marketing-Driven'), 2) + ROUND(sumIf(revenueCurrentProRataNetMedia, userBasedCluster = '03. Marketing-Driven'), 2) + ROUND(sumIf(revenueCurrentProRataDataMonetization, userBasedCluster = '03. Marketing-Driven'), 2)) / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  - name: ROAS Pro Rata 03. Marketing-Driven - revenueOperationalCore
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND((sumIf(revenueOperationalCore, userBasedCluster = '03. Marketing-Driven') + ROUND(sumIf(revenueCurrentProRataMal, userBasedCluster = '03. Marketing-Driven'), 2) + ROUND(sumIf(revenueCurrentProRataNetMedia, userBasedCluster = '03. Marketing-Driven'), 2) + ROUND(sumIf(revenueCurrentProRataDataMonetization, userBasedCluster = '03. Marketing-Driven'), 2)) / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  - name: ROAS Pro Rata 04. New Notpaid - revenueCurrentCore
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND(sumIf(revenueCurrentProRataTotal, userBasedCluster = '04. New Notpaid') / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  - name: ROAS Pro Rata 04. New Notpaid - revenueEcpcCore
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND((sumIf(revenueEcpcCore, userBasedCluster = '04. New Notpaid') + ROUND(sumIf(revenueCurrentProRataMal, userBasedCluster = '04. New Notpaid'), 2) + ROUND(sumIf(revenueCurrentProRataNetMedia, userBasedCluster = '04. New Notpaid'), 2) + ROUND(sumIf(revenueCurrentProRataDataMonetization, userBasedCluster = '04. New Notpaid'), 2)) / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  - name: ROAS Pro Rata 04. New Notpaid - revenueOperationalCore
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND((sumIf(revenueOperationalCore, userBasedCluster = '04. New Notpaid') + ROUND(sumIf(revenueCurrentProRataMal, userBasedCluster = '04. New Notpaid'), 2) + ROUND(sumIf(revenueCurrentProRataNetMedia, userBasedCluster = '04. New Notpaid'), 2) + ROUND(sumIf(revenueCurrentProRataDataMonetization, userBasedCluster = '04. New Notpaid'), 2)) / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  - name: ROAS Pro Rata 05. Returning Notpaid - revenueCurrentCore
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND(sumIf(revenueCurrentProRataTotal, userBasedCluster = '05. Returning Notpaid') / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  - name: ROAS Pro Rata 05. Returning Notpaid - revenueEcpcCore
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND((sumIf(revenueEcpcCore, userBasedCluster = '05. Returning Notpaid') + ROUND(sumIf(revenueCurrentProRataMal, userBasedCluster = '05. Returning Notpaid'), 2) + ROUND(sumIf(revenueCurrentProRataNetMedia, userBasedCluster = '05. Returning Notpaid'), 2) + ROUND(sumIf(revenueCurrentProRataDataMonetization, userBasedCluster = '05. Returning Notpaid'), 2)) / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  - name: ROAS Pro Rata 05. Returning Notpaid - revenueOperationalCore
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND((sumIf(revenueOperationalCore, userBasedCluster = '05. Returning Notpaid') + ROUND(sumIf(revenueCurrentProRataMal, userBasedCluster = '05. Returning Notpaid'), 2) + ROUND(sumIf(revenueCurrentProRataNetMedia, userBasedCluster = '05. Returning Notpaid'), 2) + ROUND(sumIf(revenueCurrentProRataDataMonetization, userBasedCluster = '05. Returning Notpaid'), 2)) / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  - name: ROAS Pro Rata 99. Unconsented - revenueCurrentCore
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND(sumIf(revenueCurrentProRataTotal, userBasedCluster = '99. Unconsented') / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  - name: ROAS Pro Rata 99. Unconsented - revenueEcpcCore
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND((sumIf(revenueEcpcCore, userBasedCluster = '99. Unconsented') + ROUND(sumIf(revenueCurrentProRataMal, userBasedCluster = '99. Unconsented'), 2) + ROUND(sumIf(revenueCurrentProRataNetMedia, userBasedCluster = '99. Unconsented'), 2) + ROUND(sumIf(revenueCurrentProRataDataMonetization, userBasedCluster = '99. Unconsented'), 2)) / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  - name: ROAS Pro Rata 99. Unconsented - revenueOperationalCore
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND((sumIf(revenueOperationalCore, userBasedCluster = '99. Unconsented') + ROUND(sumIf(revenueCurrentProRataMal, userBasedCluster = '99. Unconsented'), 2) + ROUND(sumIf(revenueCurrentProRataNetMedia, userBasedCluster = '99. Unconsented'), 2) + ROUND(sumIf(revenueCurrentProRataDataMonetization, userBasedCluster = '99. Unconsented'), 2)) / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  - name: RPMS Core - revenueCurrentCore
+    source: [sessions]
+    expression: if(SUM(sessions) = 0, 0, ROUND(SUM(revenueCurrentCore)/SUM(sessions)* 1000,2))
+  - name: RPMS Core - revenueEcpcCore
+    source: [sessions]
+    expression: if(SUM(sessions) = 0, 0, ROUND(SUM(revenueEcpcCore)/SUM(sessions)* 1000,2))
+  - name: RPMS Core - revenueOperationalCore
+    source: [sessions]
+    expression: if(SUM(sessions) = 0, 0, ROUND(SUM(revenueOperationalCore)/SUM(sessions)* 1000,2))
+  - name: RPMS Core Car - revenueCurrentCoreCar
+    source: [sessions]
+    expression: if(SUM(sessions) = 0, 0, ROUND(SUM(revenueCurrentCoreCar)/SUM(sessions)* 1000,2))
+  - name: RPMS Core Car - revenueEcpcCoreCar
+    source: [sessions]
+    expression: if(SUM(sessions) = 0, 0, ROUND(SUM(revenueEcpcCoreCar)/SUM(sessions)* 1000,2))
+  - name: RPMS Core Car - revenueOperationalCoreCar
+    source: [sessions]
+    expression: if(SUM(sessions) = 0, 0, ROUND(SUM(revenueOperationalCoreCar)/SUM(sessions)* 1000,2))
+  - name: RPMS Core Flight - revenueCurrentCoreFlight
+    source: [sessions]
+    expression: if(SUM(sessions) = 0, 0, ROUND(SUM(revenueCurrentCoreFlight)/SUM(sessions)* 1000,2))
+  - name: RPMS Core Flight - revenueEcpcCoreFlight
+    source: [sessions]
+    expression: if(SUM(sessions) = 0, 0, ROUND(SUM(revenueEcpcCoreFlight)/SUM(sessions)* 1000,2))
+  - name: RPMS Core Flight - revenueOperationalCoreFlight
+    source: [sessions]
+    expression: if(SUM(sessions) = 0, 0, ROUND(SUM(revenueOperationalCoreFlight)/SUM(sessions)* 1000,2))
+  - name: RPMS Full Core - revenueCurrentProRataFullCore
+    source: [sessions]
+    expression: if(SUM(sessions) = 0, 0, ROUND((SUM(revenueCurrentCore)+SUM(revenueCurrentProRataMalCore))/SUM(sessions)* 1000,2))
+  - name: STR
+    source: [sessions]
+    expression: if(SUM(searches) = 0, 0, ROUND(SUM(searches)/ SUM(sessions),4))
+  - name: STR Car
+    source: [sessions]
+    expression: if(SUM(searchesCar) = 0, 0, ROUND(SUM(searchesCar)/ SUM(sessions),4))
+  - name: STR Flight
+    source: [sessions]
+    expression: if(SUM(searchesFlight) = 0, 0, ROUND(SUM(searchesFlight)/ SUM(sessions),4))
+  - name: clicks
+    source: [sessions]
+    expression: SUM(clicksCore + clicksMal)
+  - name: clicksCar
+    source: [sessions]
+    expression: SUM(clicksCoreCar + clicksMalCar)
+  - name: clicksDynamicPackage
+    source: [sessions]
+    expression: SUM(clicksCoreDynamicPackage + clicksMalDynamicPackage)
+  - name: clicksFlight
+    source: [sessions]
+    expression: SUM(clicksCoreFlight + clicksMalFlight)
+  - name: clicksProRataGAds
+    source: [sessions]
+    expression: ROUND(SUM(clicksProRataGAds), 2)
+  - name: conversionsProRataGAds
+    source: [sessions]
+    expression: ROUND(SUM(conversionsProRataGAds), 2)
+  - name: costProRataDs
+    source: [sessions]
+    expression: ROUND(SUM(costProRataDs), 2)
+  - name: costProRataGAds
+    source: [sessions]
+    expression: ROUND(SUM(costProRataGAds), 2)
+  - name: costProRataMktg
+    source: [sessions]
+    expression: ROUND(SUM(costProRataMktg), 2)
+  - name: costProRataNotSem
+    source: [sessions]
+    expression: ROUND(SUM(costProRataNotSem), 2)
+  - name: eCPC Conversions
+    source: [sessions]
+    expression: if(SUM(commissionValueCalculated) = 0, 0 ,ROUND(SUM(commissionValueCalculated)/SUM(clicksCore),2))
+  - name: eCPC Conversions Car
+    source: [sessions]
+    expression: if(SUM(commissionValueCalculatedCar) = 0, 0 ,ROUND(SUM(commissionValueCalculatedCar)/SUM(clicksCoreCar),2))
+  - name: eCPC Conversions Flight
+    source: [sessions]
+    expression: if(SUM(commissionValueCalculatedFlight) = 0, 0 ,ROUND(SUM(commissionValueCalculatedFlight)/SUM(clicksCoreFlight),2))
+  - name: eCPC Core - revenueCurrentCore
+    source: [sessions, searches]
+    expression: if(SUM(clicksCore) = 0, 0, ROUND(SUM(revenueCurrentCore)/SUM(clicksCore), 2))
+  - name: eCPC Core - revenueEcpcCore
+    source: [sessions, searches]
+    expression: if(SUM(clicksCore) = 0, 0, ROUND(SUM(revenueEcpcCore)/SUM(clicksCore), 2))
+  - name: eCPC Core - revenueOperationalCore
+    source: [sessions, searches]
+    expression: if(SUM(clicksCore) = 0, 0, ROUND(SUM(revenueOperationalCore)/SUM(clicksCore), 2))
+  - name: eCPC Full Core - revenueCurrentFullCore
+    source: [searches]
+    expression: if(SUM(clicksCore) + SUM(clicksMalCore) = 0, 0, ROUND((SUM(revenueCurrentCore) + SUM(revenueCurrentMalCore))/(SUM(clicksCore) + SUM(clicksMalCore)), 2))
+  - name: eCPC Full Core - revenueCurrentProRataFullCore
+    source: [sessions]
+    expression: if((SUM(clicksCore) + SUM(clicksMalCore)) = 0, 0, ROUND((SUM(revenueCurrentCore) + SUM(revenueCurrentProRataMalCore))/(SUM(clicksCore) + SUM(clicksMalCore)), 2))
+  - name: eCPC Flight - revenueCurrentCoreFlight
+    source: [sessions]
+    expression: if(SUM(clicksCoreFlight) = 0, 0, ROUND(SUM(revenueCurrentCoreFlight)/SUM(clicksCoreFlight), 2))
+  - name: eCPC Flight - revenueEcpcCoreFlight
+    source: [sessions]
+    expression: if(SUM(clicksCoreFlight) = 0, 0, ROUND(SUM(revenueEcpcCoreFlight)/SUM(clicksCoreFlight), 2))
+  - name: eCPC Flight - revenueOperationalCoreFlight
+    source: [sessions]
+    expression: if(SUM(clicksCoreFlight) = 0, 0, ROUND(SUM(revenueOperationalCoreFlight)/SUM(clicksCoreFlight), 2))
+  # Gross Profit and Gross Margin — business definitions (and how to aggregate and read GM) in data/metrics.md.
+  - name: grossProfitProRata
+    source: [sessions]
+    expression: SUM(revenueCurrentProRataTotal) - ROUND(SUM(costProRataMktg), 2)
+  - name: grossMarginProRata
+    source: [sessions]
+    expression: if(SUM(revenueCurrentProRataTotal) = 0, NULL, ROUND((SUM(revenueCurrentProRataTotal) - ROUND(SUM(costProRataMktg), 2)) / SUM(revenueCurrentProRataTotal) * 100, 2))
+  - name: impressionsProRataGAds
+    source: [sessions]
+    expression: ROUND(SUM(impressionsProRataGAds), 2)
+  - name: revenueCurrentProRataAfs
+    source: [sessions]
+    expression: ROUND(SUM(revenueCurrentProRataAfs), 2)
+  - name: revenueCurrentProRataAm
+    source: [sessions]
+    expression: ROUND(SUM(revenueCurrentProRataAm), 2)
+  - name: revenueCurrentProRataAu
+    source: [sessions]
+    expression: ROUND(SUM(revenueCurrentProRataAu), 2)
+  - name: revenueCurrentProRataGam
+    source: [sessions]
+    expression: ROUND(SUM(revenueCurrentProRataGam), 2)
+  - name: revenueCurrentProRataMal
+    source: [sessions]
+    expression: ROUND(SUM(revenueCurrentProRataMal), 2)
+  - name: revenueCurrentProRataMalCore
+    source: [sessions]
+    expression: ROUND(SUM(revenueCurrentProRataMalCore), 2)
+  - name: revenueCurrentProRataMalMedia
+    source: [sessions]
+    expression: ROUND(SUM(revenueCurrentProRataMalMedia), 2)
+  - name: revenueCurrentProRataMedia
+    source: [sessions]
+    expression: ROUND(SUM(revenueCurrentProRataMedia), 2)
+  - name: revenueCurrentProRataNetGam
+    source: [sessions]
+    expression: ROUND(SUM(revenueCurrentProRataNetGam), 2)
+  - name: revenueCurrentProRataNetMedia
+    source: [sessions]
+    expression: ROUND(SUM(revenueCurrentProRataNetMedia), 2)
+  - name: revenueCurrentProRataTotal
+    source: [sessions]
+    expression: ROUND(SUM(revenueCurrentProRataTotal), 2)
+  - name: revenueCurrentProRataDataMonetization
+    source: [sessions]
+    expression: ROUND(SUM(revenueCurrentProRataDataMonetization), 2)
+  # roasProRata family: the metric names as they exist in the Superset dataset, so a
+  # question phrased the way an analyst sees it resolves here. These seven are ALIASES
+  # of the "ROAS Pro Rata ... - revenueCurrentCore" metrics above: same expression,
+  # both names kept on purpose. Change one, change the other — and do not present
+  # them side by side, the delta is always zero.
+  # All six cluster members sum back to `roasProRata` — see the ROAS Pro Rata note
+  # earlier in this file.
+  - name: roasProRata
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND(SUM(revenueCurrentProRataTotal) / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  - name: roasProRata - 01. New Paid
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND(sumIf(revenueCurrentProRataTotal, userBasedCluster = '01. New Paid') / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  - name: roasProRata - 02. Returning Paid
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND(sumIf(revenueCurrentProRataTotal, userBasedCluster = '02. Returning Paid') / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  - name: roasProRata - 03. Marketing-Driven
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND(sumIf(revenueCurrentProRataTotal, userBasedCluster = '03. Marketing-Driven') / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  - name: roasProRata - 04. New Notpaid
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND(sumIf(revenueCurrentProRataTotal, userBasedCluster = '04. New Notpaid') / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  - name: roasProRata - 05. Returning Notpaid
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND(sumIf(revenueCurrentProRataTotal, userBasedCluster = '05. Returning Notpaid') / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  - name: roasProRata - 99. Unconsented
+    source: [sessions]
+    expression: if(ROUND(SUM(costProRataMktg), 2) = 0, 0, ROUND(sumIf(revenueCurrentProRataTotal, userBasedCluster = '99. Unconsented') / ROUND(SUM(costProRataMktg), 2) * 100, 2))
+  # STR decomposition — searchFrequencyRate and searchReach are the two factors of
+  # STR: searchReach x searchFrequencyRate = STR. searchReach is how many sessions
+  # search at all (engagement), searchFrequencyRate is how much those sessions search
+  # (search depth). ICE impact models use the two factors by default and collapse to
+  # STR only when an initiative hits the funnel undifferentiated — never apply a delta
+  # to STR and to a factor in the same model.
+  #
+  # searchReach was called nonBounceRate until 2026-09, and still is in the ICE
+  # framework skill and the jc-ice-evaluation project prompt; searchReach is the name
+  # an analyst now sees in Superset. Same metric, two names.
+  #
+  # Both are rounded to 4 decimals like every other rate in this file, NOT to the 2
+  # the Superset expressions use. Two decimals break the decomposition: on Aug 2026
+  # web, 0.5823 x 1.7084 = 0.9948 against an STR of 0.9947, but 0.58 x 1.71 = 0.9918,
+  # a -0.29% error that propagates straight into the ICE revenue formula the factors
+  # feed. It also flattens the sub-point deltas ICE reasons about (+0.50pp, +0.0139).
+  #
+  # UNITS DIFFER, do not format them alike: searchReach is a proportion in [0,1] and
+  # displays as a percentage; searchFrequencyRate is an average count per searching
+  # session, routinely > 1 (app Aug 2026 = 3.07) and must NEVER display as a
+  # percentage. Their product may legitimately exceed 100%.
+  #
+  # searchReachCar / searchReachFlight are searchReach for one product: same
+  # denominator (ALL sessions, not the product's own), so they do NOT sum to
+  # searchReach — a session searching both products counts in both. They were named
+  # sessionsWithSearchCar % / sessionsWithSearchFlight % until 2026-09, renamed with
+  # searchReach itself to match Superset. searchFrequencyRate has no product
+  # declination here.
+  - name: searchFrequencyRate
+    source: [sessions]
+    expression: if(SUM(sessionsWithSearch) = 0, 0, ROUND(SUM(searches)/SUM(sessionsWithSearch), 4))
+  - name: searchReach
+    source: [sessions]
+    expression: if(SUM(sessions) = 0, 0, ROUND(SUM(sessionsWithSearch)/SUM(sessions), 4))
+  - name: searchReachCar
+    source: [sessions]
+    expression: if(SUM(sessions) = 0, 0, ROUND(SUM(sessionsWithSearchCar)/SUM(sessions), 4))
+  - name: searchReachFlight
+    source: [sessions]
+    expression: if(SUM(sessions) = 0, 0, ROUND(SUM(sessionsWithSearchFlight)/SUM(sessions), 4))
+  - name: sessionsWithClickCoreCar %
+    source: [sessions]
+    expression: ROUND(SUM(sessionsWithClickCoreCar)/SUM(sessions), 4)
+  - name: sessionsWithClickCoreFlight %
+    source: [sessions]
+    expression: ROUND(SUM(sessionsWithClickCoreFlight)/SUM(sessions), 4)
+  - name: views
+    source: [sessions]
+    expression: SUM(length(pagesName))
+  - name: CR Core
+    source: [searches]
+    expression: if(SUM(conversions) = 0, 0 , ROUND(SUM(conversions)/SUM(clicksCore),4))
+  - name: CTR Core
+    source: [searches, sessions]
+    expression: if(SUM(clicksCore) = 0, 0, ROUND(SUM(clicksCore)/ SUM(searches),4))
+  - name: CTR Full Core
+    source: [searches, sessions]
+    expression: if(SUM(searches) = 0, 0, ROUND((SUM(clicksCore) + SUM(clicksMalCore))/ SUM(searches),4))
+  - name: eCPC Clicks Core
+    source: [searches]
+    expression: if(SUM(revenueCore) = 0, 0 ,ROUND(SUM(revenueCore)/SUM(clicksCore),2))
+  - name: eCPC Conversions Core
+    source: [searches]
+    expression: if(SUM(commissionValueCalculated) = 0, 0 ,ROUND(SUM(commissionValueCalculated)/SUM(clicksCore),2))
+  - name: searchesWithClickCore %
+    source: [searches]
+    expression: ROUND(SUM(searchesWithClickCore)/SUM(searches), 4)
+  - name: CR
+    source: [clicks]
+    expression: if(SUM(conversions) = 0, 0 , ROUND(SUM(conversions)/SUM(clicks),4))
+  - name: eCPC - revenueCurrent
+    source: [clicks]
+    expression: if(SUM(clicks) = 0, 0, ROUND(SUM(revenueCurrent)/SUM(clicks), 2))
+  - name: eCPC - revenueEcpc
+    source: [clicks]
+    expression: if(SUM(clicks) = 0, 0, ROUND(SUM(revenueEcpc)/SUM(clicks), 2))
+  - name: eCPC - revenueOperational
+    source: [clicks]
+    expression: if(SUM(clicks) = 0, 0, ROUND(SUM(revenueOperational)/SUM(clicks), 2))
+  - name: eCPC Conversions
+    source: [clicks]
+    expression: if(SUM(commissionValueCalculated) = 0, 0 ,ROUND(SUM(commissionValueCalculated)/SUM(clicks),2))
+  - name: clicksProRataDs
+    source: [sessions]
+    expression: ROUND(SUM(clicksProRataDs), 2)
+  - name: impressionsProRataDs
+    source: [sessions]
+    expression: ROUND(SUM(impressionsProRataDs), 2)
+  - name: clicksProRataMktg
+    source: [sessions]
+    expression: ROUND(SUM(clicksProRataMktg), 2)
+  - name: impressionsProRataMktg
+    source: [sessions]
+    expression: ROUND(SUM(impressionsProRataMktg), 2)
+  - name: clicksFullCore
+    source: [searches, sessions]
+    expression: SUM(clicksCore) + SUM(clicksMalCore)
+  - name: revenueCurrentProRataFullCore
+    source: [sessions]
+    expression: SUM(revenueCurrentCore) + ROUND(SUM(revenueCurrentProRataMalCore), 2)
+  - name: revenueCurrentFullCore
+    source: [searches, impressions]
+    expression: SUM(revenueCurrentCore) + SUM(revenueCurrentMalCore)
+
+# --- Users Datamart: Active Users (unique user counts by step) ---
+  - name: Active Users - Session Qualified
+    source: [users]
+    expression: sumIf(users, step = '01. Session Qualified')
+  - name: Active Users - Flight Search
+    source: [users]
+    expression: sumIf(users, step = '02. Flight Search')
+  - name: Active Users - Flight Impression Detail Page
+    source: [users]
+    expression: sumIf(users, step = '03. Flight Impression Detail Page')
+  - name: Active Users - Flight Click Core
+    source: [users]
+    expression: sumIf(users, step = '04. Flight Click Core')
+  - name: Active Users - Flight Booking
+    source: [users]
+    expression: sumIf(users, step = '05. Flight Booking')
+
+  # --- Users Datamart: Step Counts (total actions by step, via stepValue) ---
+  - name: Session Qualified
+    source: [users]
+    expression: sumIf(stepValue, step = '01. Session Qualified')
+  - name: Flight Search
+    source: [users]
+    expression: sumIf(stepValue, step = '02. Flight Search')
+  - name: Flight Impression Detail Page
+    source: [users]
+    expression: sumIf(stepValue, step = '03. Flight Impression Detail Page')
+  - name: Flight Click Core
+    source: [users]
+    expression: sumIf(stepValue, step = '04. Flight Click Core')
+  - name: Flight Booking
+    source: [users]
+    expression: sumIf(stepValue, step = '05. Flight Booking')
